@@ -1,0 +1,16 @@
+# Build artifacts and local caches
+*.exe
+*.exe~
+*.cpu
+*.log
+.gocache/
+
+# Test fixtures and generated extractor output
+testdata/
+extract-output/
+images/
+tmp-shape/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
