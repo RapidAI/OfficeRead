@@ -93,7 +93,7 @@ go run ./cmd/extracttest -out extract-output testdata/samples
 Compatibility report helper:
 
 ```bash
-go run ./cmd/compatcheck -json compat-report.json -csv compat-report.csv testdata/samples
+go run ./cmd/compatcheck -jobs 4 -markdown -json compat-report.json -csv compat-report.csv testdata/samples
 ```
 
 ### API
@@ -267,7 +267,7 @@ go run ./cmd/extracttest -out extract-output testdata/samples
 兼容性扫描工具：
 
 ```bash
-go run ./cmd/compatcheck -json compat-report.json -csv compat-report.csv testdata/samples
+go run ./cmd/compatcheck -jobs 4 -markdown -json compat-report.json -csv compat-report.csv testdata/samples
 ```
 
 ### API 文档
