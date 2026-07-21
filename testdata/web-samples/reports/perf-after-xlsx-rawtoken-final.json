@@ -1,0 +1,106 @@
+{
+  "startedAt": "2026-06-25T00:24:37+08:00",
+  "finishedAt": "2026-06-25T00:24:57+08:00",
+  "inputs": [
+    "testdata\\web-samples\\samples\\xlsx\\apache__tika__tika-parsers_tika-parsers-standard_tika-parsers-standard-modules_tika-parser-microsoft-module_src_test_resources_test-documents_testRecordSizeExceeded.xlsx",
+    "testdata\\web-samples\\samples\\xlsx\\00012389.xlsx",
+    "testdata\\web-samples\\samples\\xlsx\\00014878.xlsx",
+    "testdata\\web-samples\\samples\\xls\\008055.xls",
+    "testdata\\web-samples\\samples\\docx\\00003763.docx",
+    "testdata\\web-samples\\samples\\docx\\223624.docx"
+  ],
+  "summary": {
+    ".docx": {
+      "total": 2,
+      "ok": 2,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 1210131,
+      "images": 43,
+      "millis": 7634,
+      "maxMillis": 4504,
+      "over10Sec": 0
+    },
+    ".xls": {
+      "total": 1,
+      "ok": 1,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 17684747,
+      "images": 0,
+      "millis": 2668,
+      "maxMillis": 2668,
+      "over10Sec": 0
+    },
+    ".xlsx": {
+      "total": 3,
+      "ok": 3,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 202361636,
+      "images": 0,
+      "millis": 9063,
+      "maxMillis": 5377,
+      "over10Sec": 0
+    }
+  },
+  "files": [
+    {
+      "path": "testdata\\web-samples\\samples\\docx\\00003763.docx",
+      "ext": ".docx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 452979,
+      "images": 10,
+      "millis": 4504
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\docx\\223624.docx",
+      "ext": ".docx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 757152,
+      "images": 33,
+      "millis": 3130
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\xls\\008055.xls",
+      "ext": ".xls",
+      "ok": true,
+      "empty": false,
+      "textBytes": 17684747,
+      "images": 0,
+      "millis": 2668
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\xlsx\\00012389.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 11148655,
+      "images": 0,
+      "millis": 3161
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\xlsx\\00014878.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 9879551,
+      "images": 0,
+      "millis": 525
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\xlsx\\apache__tika__tika-parsers_tika-parsers-standard_tika-parsers-standard-modules_tika-parser-microsoft-module_src_test_resources_test-documents_testRecordSizeExceeded.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 181333430,
+      "images": 0,
+      "millis": 5377
+    }
+  ]
+}

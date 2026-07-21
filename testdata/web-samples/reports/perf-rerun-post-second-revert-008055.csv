@@ -1,0 +1,2 @@
+path,ext,ok,empty,textBytes,images,error,panic,millis
+testdata\web-samples\samples\xls\008055.xls,.xls,true,false,17684747,0,,,21836

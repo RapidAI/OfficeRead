@@ -1,0 +1,86 @@
+{
+  "startedAt": "2026-06-24T23:22:36+08:00",
+  "finishedAt": "2026-06-24T23:23:02+08:00",
+  "inputs": [
+    "testdata\\web-samples\\samples\\docx\\223624.docx",
+    "testdata\\web-samples\\samples\\docx\\00003763.docx",
+    "testdata\\web-samples\\samples\\xlsx\\apache__tika__tika-parsers_tika-parsers-standard_tika-parsers-standard-modules_tika-parser-microsoft-module_src_test_resources_test-documents_testRecordSizeExceeded.xlsx",
+    "testdata\\web-samples\\samples\\xls\\008055.xls"
+  ],
+  "summary": {
+    ".docx": {
+      "total": 2,
+      "ok": 2,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 1210131,
+      "images": 43,
+      "millis": 8865,
+      "maxMillis": 4810,
+      "over10Sec": 0
+    },
+    ".xls": {
+      "total": 1,
+      "ok": 1,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 17684747,
+      "images": 0,
+      "millis": 7273,
+      "maxMillis": 7273,
+      "over10Sec": 0
+    },
+    ".xlsx": {
+      "total": 1,
+      "ok": 1,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 181333430,
+      "images": 0,
+      "millis": 8942,
+      "maxMillis": 8942,
+      "over10Sec": 0
+    }
+  },
+  "files": [
+    {
+      "path": "testdata\\web-samples\\samples\\docx\\00003763.docx",
+      "ext": ".docx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 452979,
+      "images": 10,
+      "millis": 4810
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\docx\\223624.docx",
+      "ext": ".docx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 757152,
+      "images": 33,
+      "millis": 4055
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\xls\\008055.xls",
+      "ext": ".xls",
+      "ok": true,
+      "empty": false,
+      "textBytes": 17684747,
+      "images": 0,
+      "millis": 7273
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\xlsx\\apache__tika__tika-parsers_tika-parsers-standard_tika-parsers-standard-modules_tika-parser-microsoft-module_src_test_resources_test-documents_testRecordSizeExceeded.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 181333430,
+      "images": 0,
+      "millis": 8942
+    }
+  ]
+}

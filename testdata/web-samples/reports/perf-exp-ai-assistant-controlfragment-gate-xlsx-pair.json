@@ -1,0 +1,56 @@
+{
+  "startedAt": "2026-07-06T03:17:45+08:00",
+  "finishedAt": "2026-07-06T03:18:00+08:00",
+  "inputs": [
+    "testdata\\web-samples\\samples\\xlsx\\apache__tika__tika-parsers_tika-parsers-standard_tika-parsers-standard-modules_tika-parser-microsoft-module_src_test_resources_test-documents_testRecordSizeExceeded.xlsx",
+    "testdata\\web-samples\\samples\\xlsx\\00012389.xlsx"
+  ],
+  "summary": {
+    ".xlsx": {
+      "total": 2,
+      "ok": 2,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 192482085,
+      "images": 0,
+      "millis": 5075,
+      "maxMillis": 3097,
+      "over10Sec": 0
+    }
+  },
+  "files": [
+    {
+      "path": "testdata\\web-samples\\samples\\xlsx\\00012389.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 11148655,
+      "images": 0,
+      "millis": 1978,
+      "minMillis": 1956,
+      "maxMillis": 2317,
+      "runs": [
+        1978,
+        1956,
+        2317
+      ]
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\xlsx\\apache__tika__tika-parsers_tika-parsers-standard_tika-parsers-standard-modules_tika-parser-microsoft-module_src_test_resources_test-documents_testRecordSizeExceeded.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 181333430,
+      "images": 0,
+      "millis": 3097,
+      "minMillis": 2885,
+      "maxMillis": 3358,
+      "runs": [
+        3358,
+        2885,
+        3097
+      ]
+    }
+  ]
+}

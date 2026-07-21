@@ -1,0 +1,6 @@
+path,ext,ok,empty,textBytes,images,error,panic,millis
+testdata\web-samples\samples\docx\00003763.docx,.docx,true,false,452979,10,,,5277
+testdata\web-samples\samples\docx\223624.docx,.docx,true,false,757152,33,,,3508
+testdata\web-samples\samples\xls\008055.xls,.xls,true,false,17684747,0,,,2556
+testdata\web-samples\samples\xlsx\00012389.xlsx,.xlsx,true,false,11148655,0,,,2688
+testdata\web-samples\samples\xlsx\apache__tika__tika-parsers_tika-parsers-standard_tika-parsers-standard-modules_tika-parser-microsoft-module_src_test_resources_test-documents_testRecordSizeExceeded.xlsx,.xlsx,true,false,181333430,0,,,5295

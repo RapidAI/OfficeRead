@@ -1,0 +1,16 @@
+path,ext,ok,empty,textBytes,images,error,panic,millis,minMillis,maxMillis,runs
+testdata/web-samples/samples/xls/000051.xls,.xls,true,false,8549,0,,,60,56,68,60|60|58|56|58|68|67
+testdata/web-samples/samples/xls/003995.xls,.xls,true,false,57996,0,,,66,64,69,67|64|66|66|66|69|68
+testdata/web-samples/samples/xls/004703.xls,.xls,true,false,99952,0,,,282,273,296,282|296|274|291|273|282|276
+testdata/web-samples/samples/xls/006812.xls,.xls,true,false,115945,0,,,114,105,129,115|129|109|112|115|114|105
+testdata/web-samples/samples/xls/009715.xls,.xls,true,false,14820,0,,,21,16,28,16|19|22|28|28|21|20
+testdata/web-samples/samples/xls/009933.xls,.xls,true,false,1480,0,,,7,4,8,8|5|8|7|7|4|6
+testdata/web-samples/samples/xls/010276.xls,.xls,true,false,17790,0,,,19,17,23,20|18|23|17|18|22|19
+testdata/web-samples/samples/xls/010480.xls,.xls,true,false,6872,0,,,76,66,86,80|77|66|76|74|86|75
+testdata/web-samples/samples/xls/010701.xls,.xls,true,false,1026,0,,,1,0,2,1|1|1|2|1|0|2
+testdata/web-samples/samples/xls/015300.xls,.xls,true,false,64438,0,,,131,125,144,131|128|127|140|125|138|144
+testdata/web-samples/samples/xls/018541.xls,.xls,true,false,47719,0,,,67,66,75,75|66|67|72|67|66|75
+testdata/web-samples/samples/xls/022230.xls,.xls,true,false,124330,0,,,84,80,90,89|90|84|80|82|86|84
+testdata/web-samples/samples/xls/022238.xls,.xls,true,false,15720,0,,,26,24,29,25|26|24|26|29|27|25
+testdata/web-samples/samples/xls/022239.xls,.xls,true,false,123154,0,,,56,52,60,56|55|55|60|59|59|52
+testdata/web-samples/samples/xls/022241.xls,.xls,true,false,19078,0,,,14,13,16,14|13|16|15|15|13|13

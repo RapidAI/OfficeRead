@@ -1,0 +1,5 @@
+path,ext,ok,empty,textBytes,images,error,panic,millis
+testdata\web-samples\samples\pptx\00020725.pptx,.pptx,true,false,75992,297,,,1003
+testdata\web-samples\samples\pptx\00022381.pptx,.pptx,true,false,36730,29,,,554
+testdata\web-samples\samples\pptx\00026428.pptx,.pptx,true,false,24999,58,,,872
+testdata\web-samples\samples\pptx\406730.pptx,.pptx,true,false,13336,737,,,1904

@@ -1,0 +1,11 @@
+path,ext,ok,empty,textBytes,images,error,panic,millis
+testdata\web-samples\samples\xls\002505.xls,.xls,true,false,3123432,0,,,1342
+testdata\web-samples\samples\xls\008055.xls,.xls,true,false,17684747,0,,,6064
+testdata\web-samples\samples\xls\016161.xls,.xls,true,false,8179182,0,,,2756
+testdata\web-samples\samples\xlsx\00012389.xlsx,.xlsx,true,false,11148655,0,,,3634
+testdata\web-samples\samples\xlsx\00014878.xlsx,.xlsx,true,false,9879551,0,,,885
+testdata\web-samples\samples\xlsx\00014957.xlsx,.xlsx,true,false,4927808,0,,,731
+testdata\web-samples\samples\xlsx\00014984.xlsx,.xlsx,true,false,8624718,0,,,897
+testdata\web-samples\samples\xlsx\00017009.xlsx,.xlsx,true,false,5432023,0,,,1015
+testdata\web-samples\samples\xlsx\00019224.xlsx,.xlsx,true,false,8968495,0,,,903
+testdata\web-samples\samples\xlsx\apache__tika__tika-parsers_tika-parsers-standard_tika-parsers-standard-modules_tika-parser-microsoft-module_src_test_resources_test-documents_testRecordSizeExceeded.xlsx,.xlsx,true,false,181333430,0,,,9065

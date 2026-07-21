@@ -1,0 +1,2 @@
+path,ext,ok,empty,textBytes,images,error,panic,millis,minMillis,maxMillis,runs
+testdata/web-samples/samples/xlsx/00012389.xlsx,.xlsx,true,false,11148655,0,,,3412,2758,5034,2758|5034|3309|3572|3412

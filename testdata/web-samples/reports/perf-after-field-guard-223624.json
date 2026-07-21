@@ -1,0 +1,42 @@
+{
+  "startedAt": "2026-06-24T23:13:49+08:00",
+  "finishedAt": "2026-06-24T23:14:07+08:00",
+  "inputs": [
+    "testdata\\web-samples\\samples\\docx\\223624.docx",
+    "testdata\\web-samples\\samples\\docx\\00003763.docx"
+  ],
+  "summary": {
+    ".docx": {
+      "total": 2,
+      "ok": 2,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 1210131,
+      "images": 43,
+      "millis": 18392,
+      "maxMillis": 14367,
+      "over10Sec": 1
+    }
+  },
+  "files": [
+    {
+      "path": "testdata\\web-samples\\samples\\docx\\00003763.docx",
+      "ext": ".docx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 452979,
+      "images": 10,
+      "millis": 14367
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\docx\\223624.docx",
+      "ext": ".docx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 757152,
+      "images": 33,
+      "millis": 4025
+    }
+  ]
+}

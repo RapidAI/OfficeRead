@@ -1,0 +1,32 @@
+{
+  "startedAt": "2026-06-30T06:49:39+08:00",
+  "finishedAt": "2026-06-30T06:50:02+08:00",
+  "inputs": [
+    "testdata\\web-samples\\samples\\xls\\019089.xls"
+  ],
+  "summary": {
+    ".xls": {
+      "total": 1,
+      "ok": 1,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 306058,
+      "images": 0,
+      "millis": 22521,
+      "maxMillis": 22521,
+      "over10Sec": 1
+    }
+  },
+  "files": [
+    {
+      "path": "testdata\\web-samples\\samples\\xls\\019089.xls",
+      "ext": ".xls",
+      "ok": true,
+      "empty": false,
+      "textBytes": 306058,
+      "images": 0,
+      "millis": 22521
+    }
+  ]
+}

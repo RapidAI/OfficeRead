@@ -5,8 +5,7 @@
 *.log
 .gocache/
 
-# Test fixtures and generated extractor output
-testdata/
+# Generated extractor output
 extract-output/
 images/
 tmp-shape/

@@ -1,0 +1,32 @@
+{
+  "startedAt": "2026-06-24T23:04:20+08:00",
+  "finishedAt": "2026-06-24T23:04:40+08:00",
+  "inputs": [
+    "testdata\\web-samples\\samples\\docx\\223624.docx"
+  ],
+  "summary": {
+    ".docx": {
+      "total": 1,
+      "ok": 1,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 757148,
+      "images": 33,
+      "millis": 19612,
+      "maxMillis": 19612,
+      "over10Sec": 1
+    }
+  },
+  "files": [
+    {
+      "path": "testdata\\web-samples\\samples\\docx\\223624.docx",
+      "ext": ".docx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 757148,
+      "images": 33,
+      "millis": 19612
+    }
+  ]
+}

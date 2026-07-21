@@ -1,0 +1,41 @@
+{
+  "startedAt": "2026-07-06T04:53:08+08:00",
+  "finishedAt": "2026-07-06T04:53:23+08:00",
+  "inputs": [
+    "testdata/web-samples/samples/xlsx/00012389.xlsx"
+  ],
+  "summary": {
+    ".xlsx": {
+      "total": 1,
+      "ok": 1,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 11148655,
+      "images": 0,
+      "millis": 3141,
+      "maxMillis": 3141,
+      "over10Sec": 0
+    }
+  },
+  "files": [
+    {
+      "path": "testdata/web-samples/samples/xlsx/00012389.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 11148655,
+      "images": 0,
+      "millis": 3141,
+      "minMillis": 2426,
+      "maxMillis": 3339,
+      "runs": [
+        2426,
+        3339,
+        3177,
+        3141,
+        3094
+      ]
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "startedAt": "2026-07-05T11:23:29+08:00",
+  "finishedAt": "2026-07-05T11:23:29+08:00",
+  "inputs": [
+    "testdata\\web-samples\\samples\\pptx\\00024860.pptx"
+  ],
+  "summary": {
+    ".pptx": {
+      "total": 1,
+      "ok": 0,
+      "errors": 1,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 0,
+      "images": 0,
+      "millis": 153,
+      "maxMillis": 153,
+      "over10Sec": 0
+    }
+  },
+  "files": [
+    {
+      "path": "testdata\\web-samples\\samples\\pptx\\00024860.pptx",
+      "ext": ".pptx",
+      "ok": false,
+      "empty": false,
+      "textBytes": 0,
+      "images": 0,
+      "error": "zip: checksum error",
+      "millis": 153
+    }
+  ]
+}

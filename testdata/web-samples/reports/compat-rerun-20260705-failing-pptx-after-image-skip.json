@@ -1,0 +1,32 @@
+{
+  "startedAt": "2026-07-05T11:28:38+08:00",
+  "finishedAt": "2026-07-05T11:28:38+08:00",
+  "inputs": [
+    "testdata\\web-samples\\samples\\pptx\\00024860.pptx"
+  ],
+  "summary": {
+    ".pptx": {
+      "total": 1,
+      "ok": 1,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 2864,
+      "images": 47,
+      "millis": 282,
+      "maxMillis": 282,
+      "over10Sec": 0
+    }
+  },
+  "files": [
+    {
+      "path": "testdata\\web-samples\\samples\\pptx\\00024860.pptx",
+      "ext": ".pptx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 2864,
+      "images": 47,
+      "millis": 282
+    }
+  ]
+}

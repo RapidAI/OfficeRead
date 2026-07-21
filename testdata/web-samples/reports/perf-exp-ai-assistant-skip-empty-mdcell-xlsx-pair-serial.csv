@@ -1,0 +1,3 @@
+path,ext,ok,empty,textBytes,images,error,panic,millis,minMillis,maxMillis,runs
+D:\workprj\officeread\testdata\web-samples\samples\xlsx\00012389.xlsx,.xlsx,true,false,11148655,0,,,2307,2220,2309,2307|2220|2309
+D:\workprj\officeread\testdata\web-samples\samples\xlsx\apache__tika__tika-parsers_tika-parsers-standard_tika-parsers-standard-modules_tika-parser-microsoft-module_src_test_resources_test-documents_testRecordSizeExceeded.xlsx,.xlsx,true,false,181333430,0,,,2883,2795,3065,3065|2795|2883

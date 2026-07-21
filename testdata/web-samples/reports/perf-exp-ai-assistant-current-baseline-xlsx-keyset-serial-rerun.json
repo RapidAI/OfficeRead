@@ -1,0 +1,379 @@
+{
+  "startedAt": "2026-07-06T08:36:41+08:00",
+  "finishedAt": "2026-07-06T08:38:04+08:00",
+  "inputs": [
+    "testdata/web-samples/samples/xlsx/apache__tika__tika-parsers_tika-parsers-standard_tika-parsers-standard-modules_tika-parser-microsoft-module_src_test_resources_test-documents_testRecordSizeExceeded.xlsx",
+    "testdata/web-samples/samples/xlsx/00012389.xlsx",
+    "testdata/web-samples/samples/xlsx/00014878.xlsx",
+    "testdata/web-samples/samples/xlsx/00014984.xlsx",
+    "testdata/web-samples/samples/xlsx/00019224.xlsx",
+    "testdata/web-samples/samples/xlsx/00017009.xlsx",
+    "testdata/web-samples/samples/xlsx/00014957.xlsx",
+    "testdata/web-samples/samples/xlsx/00014999.xlsx",
+    "testdata/web-samples/samples/xlsx/00014970.xlsx",
+    "testdata/web-samples/samples/xlsx/00014857.xlsx",
+    "testdata/web-samples/samples/xlsx/00018489.xlsx",
+    "testdata/web-samples/samples/xlsx/142143-2.xlsx",
+    "testdata/web-samples/samples/xlsx/00013260.xlsx",
+    "testdata/web-samples/samples/xlsx/142143.xlsx",
+    "testdata/web-samples/samples/xlsx/219417.xlsx",
+    "testdata/web-samples/samples/xlsx/212946-2.xlsx",
+    "testdata/web-samples/samples/xlsx/00013939.xlsx",
+    "testdata/web-samples/samples/xlsx/219417-2.xlsx",
+    "testdata/web-samples/samples/xlsx/00010400.xlsx",
+    "testdata/web-samples/samples/xlsx/00017663.xlsx",
+    "testdata/web-samples/samples/xlsx/00012647.xlsx"
+  ],
+  "summary": {
+    ".xlsx": {
+      "total": 21,
+      "ok": 21,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 279385415,
+      "images": 1,
+      "millis": 27461,
+      "maxMillis": 3299,
+      "over10Sec": 0
+    }
+  },
+  "files": [
+    {
+      "path": "testdata/web-samples/samples/xlsx/00010400.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 2778014,
+      "images": 0,
+      "millis": 2765,
+      "minMillis": 1260,
+      "maxMillis": 4560,
+      "runs": [
+        1260,
+        2765,
+        4560
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00012389.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 11148655,
+      "images": 0,
+      "millis": 2814,
+      "minMillis": 2721,
+      "maxMillis": 3107,
+      "runs": [
+        3107,
+        2721,
+        2814
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00012647.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 2731103,
+      "images": 1,
+      "millis": 713,
+      "minMillis": 708,
+      "maxMillis": 761,
+      "runs": [
+        761,
+        713,
+        708
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00013260.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 3130923,
+      "images": 0,
+      "millis": 1054,
+      "minMillis": 1026,
+      "maxMillis": 1076,
+      "runs": [
+        1026,
+        1054,
+        1076
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00013939.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 3788530,
+      "images": 0,
+      "millis": 608,
+      "minMillis": 605,
+      "maxMillis": 623,
+      "runs": [
+        605,
+        623,
+        608
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00014857.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 4016789,
+      "images": 0,
+      "millis": 1123,
+      "minMillis": 1116,
+      "maxMillis": 1147,
+      "runs": [
+        1123,
+        1116,
+        1147
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00014878.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 9879551,
+      "images": 0,
+      "millis": 1111,
+      "minMillis": 1098,
+      "maxMillis": 1307,
+      "runs": [
+        1111,
+        1098,
+        1307
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00014957.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 4925019,
+      "images": 0,
+      "millis": 1320,
+      "minMillis": 1298,
+      "maxMillis": 1329,
+      "runs": [
+        1329,
+        1298,
+        1320
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00014970.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 4111885,
+      "images": 0,
+      "millis": 1150,
+      "minMillis": 1092,
+      "maxMillis": 1230,
+      "runs": [
+        1230,
+        1092,
+        1150
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00014984.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 8624718,
+      "images": 0,
+      "millis": 1062,
+      "minMillis": 1023,
+      "maxMillis": 1164,
+      "runs": [
+        1164,
+        1062,
+        1023
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00014999.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 4115251,
+      "images": 0,
+      "millis": 1031,
+      "minMillis": 1027,
+      "maxMillis": 1048,
+      "runs": [
+        1048,
+        1031,
+        1027
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00017009.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 5313775,
+      "images": 0,
+      "millis": 2116,
+      "minMillis": 1991,
+      "maxMillis": 2231,
+      "runs": [
+        1991,
+        2231,
+        2116
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00017663.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 3288008,
+      "images": 0,
+      "millis": 795,
+      "minMillis": 788,
+      "maxMillis": 830,
+      "runs": [
+        830,
+        795,
+        788
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00018489.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 4302221,
+      "images": 0,
+      "millis": 965,
+      "minMillis": 959,
+      "maxMillis": 971,
+      "runs": [
+        971,
+        965,
+        959
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/00019224.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 8968495,
+      "images": 0,
+      "millis": 1268,
+      "minMillis": 1227,
+      "maxMillis": 1293,
+      "runs": [
+        1268,
+        1293,
+        1227
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/142143-2.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 3506734,
+      "images": 0,
+      "millis": 1008,
+      "minMillis": 951,
+      "maxMillis": 1115,
+      "runs": [
+        951,
+        1008,
+        1115
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/142143.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 3506734,
+      "images": 0,
+      "millis": 958,
+      "minMillis": 958,
+      "maxMillis": 980,
+      "runs": [
+        980,
+        958,
+        958
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/212946-2.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 2902112,
+      "images": 0,
+      "millis": 400,
+      "minMillis": 394,
+      "maxMillis": 453,
+      "runs": [
+        400,
+        394,
+        453
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/219417-2.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 3506734,
+      "images": 0,
+      "millis": 1006,
+      "minMillis": 1006,
+      "maxMillis": 1018,
+      "runs": [
+        1018,
+        1006,
+        1006
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/219417.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 3506734,
+      "images": 0,
+      "millis": 895,
+      "minMillis": 848,
+      "maxMillis": 1009,
+      "runs": [
+        1009,
+        895,
+        848
+      ]
+    },
+    {
+      "path": "testdata/web-samples/samples/xlsx/apache__tika__tika-parsers_tika-parsers-standard_tika-parsers-standard-modules_tika-parser-microsoft-module_src_test_resources_test-documents_testRecordSizeExceeded.xlsx",
+      "ext": ".xlsx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 181333430,
+      "images": 0,
+      "millis": 3299,
+      "minMillis": 3299,
+      "maxMillis": 3470,
+      "runs": [
+        3470,
+        3299,
+        3299
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+path,ext,ok,empty,textBytes,images,error,panic,millis,minMillis,maxMillis,runs
+testdata\web-samples\samples\xls\002505.xls,.xls,true,false,3123432,0,,,1650,1570,1918,1570|1650|1918
+testdata\web-samples\samples\xls\006087.xls,.xls,true,false,290195,0,,,1758,1669,1853,1853|1758|1669
+testdata\web-samples\samples\xls\008055.xls,.xls,true,false,17684747,0,,,5085,5057,5297,5057|5297|5085
+testdata\web-samples\samples\xls\016161.xls,.xls,true,false,8179182,0,,,2069,2035,2079,2069|2035|2079
+testdata\web-samples\samples\xls\019088.xls,.xls,true,false,281048,0,,,1115,1024,1322,1322|1115|1024
+testdata\web-samples\samples\xls\019089.xls,.xls,true,false,306058,0,,,1100,1048,1115,1100|1115|1048

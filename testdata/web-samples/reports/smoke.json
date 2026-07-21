@@ -1,0 +1,197 @@
+{
+  "startedAt": "2026-06-24T07:02:45+08:00",
+  "finishedAt": "2026-06-24T07:02:46+08:00",
+  "inputs": [
+    "testdata"
+  ],
+  "summary": {
+    ".doc": {
+      "total": 2,
+      "ok": 2,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 9111,
+      "images": 14,
+      "millis": 132,
+      "maxMillis": 116,
+      "over10Sec": 0
+    },
+    ".docx": {
+      "total": 2,
+      "ok": 1,
+      "errors": 1,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 232,
+      "images": 0,
+      "millis": 4,
+      "maxMillis": 4,
+      "over10Sec": 0
+    },
+    ".ppt": {
+      "total": 2,
+      "ok": 2,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 875,
+      "images": 2,
+      "millis": 25,
+      "maxMillis": 14,
+      "over10Sec": 0
+    },
+    ".pptx": {
+      "total": 2,
+      "ok": 0,
+      "errors": 2,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 0,
+      "images": 0,
+      "millis": 0,
+      "maxMillis": 0,
+      "over10Sec": 0
+    },
+    ".xls": {
+      "total": 2,
+      "ok": 1,
+      "errors": 1,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 11722,
+      "images": 0,
+      "millis": 179,
+      "maxMillis": 179,
+      "over10Sec": 0
+    },
+    ".xlsx": {
+      "total": 2,
+      "ok": 0,
+      "errors": 2,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 0,
+      "images": 0,
+      "millis": 0,
+      "maxMillis": 0,
+      "over10Sec": 0
+    }
+  },
+  "files": [
+    {
+      "path": "testdata\\negative\\35897-type4.xls",
+      "ext": ".xls",
+      "ok": false,
+      "empty": false,
+      "textBytes": 0,
+      "images": 0,
+      "error": "encrypted legacy Excel document is not supported",
+      "millis": 0
+    },
+    {
+      "path": "testdata\\negative\\42464-ExpPtg-bad.xls",
+      "ext": ".xls",
+      "ok": true,
+      "empty": false,
+      "textBytes": 11722,
+      "images": 0,
+      "millis": 179
+    },
+    {
+      "path": "testdata\\negative\\54764-2.xlsx",
+      "ext": ".xlsx",
+      "ok": false,
+      "empty": false,
+      "textBytes": 0,
+      "images": 0,
+      "error": "xml doctype is not supported",
+      "millis": 0
+    },
+    {
+      "path": "testdata\\negative\\54764.xlsx",
+      "ext": ".xlsx",
+      "ok": false,
+      "empty": false,
+      "textBytes": 0,
+      "images": 0,
+      "error": "xml doctype is not supported",
+      "millis": 0
+    },
+    {
+      "path": "testdata\\negative\\57272_corrupted_usereditatom.ppt",
+      "ext": ".ppt",
+      "ok": true,
+      "empty": false,
+      "textBytes": 563,
+      "images": 2,
+      "millis": 11
+    },
+    {
+      "path": "testdata\\negative\\Divino_Revelado.pptx",
+      "ext": ".pptx",
+      "ok": false,
+      "empty": false,
+      "textBytes": 0,
+      "images": 0,
+      "error": "zip: not a valid zip file",
+      "millis": 0
+    },
+    {
+      "path": "testdata\\negative\\ExternalEntityInText.docx",
+      "ext": ".docx",
+      "ok": false,
+      "empty": false,
+      "textBytes": 0,
+      "images": 0,
+      "error": "word/document.xml: xml doctype is not supported",
+      "millis": 0
+    },
+    {
+      "path": "testdata\\negative\\Fuzzed.doc",
+      "ext": ".doc",
+      "ok": true,
+      "empty": false,
+      "textBytes": 8602,
+      "images": 14,
+      "millis": 116
+    },
+    {
+      "path": "testdata\\negative\\MultipleCoreProperties.docx",
+      "ext": ".docx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 232,
+      "images": 0,
+      "millis": 4
+    },
+    {
+      "path": "testdata\\negative\\PasswordProtected.doc",
+      "ext": ".doc",
+      "ok": true,
+      "empty": false,
+      "textBytes": 509,
+      "images": 0,
+      "millis": 16
+    },
+    {
+      "path": "testdata\\negative\\Password_Protected-56-hello.ppt",
+      "ext": ".ppt",
+      "ok": true,
+      "empty": false,
+      "textBytes": 312,
+      "images": 0,
+      "millis": 14
+    },
+    {
+      "path": "testdata\\negative\\clusterfuzz-testcase-minimized-POIFuzzer-5205835528404992.pptx",
+      "ext": ".pptx",
+      "ok": false,
+      "empty": false,
+      "textBytes": 0,
+      "images": 0,
+      "error": "zip: not a valid zip file",
+      "millis": 0
+    }
+  ]
+}

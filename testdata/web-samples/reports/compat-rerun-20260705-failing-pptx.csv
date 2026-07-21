@@ -1,0 +1,2 @@
+path,ext,ok,empty,textBytes,images,error,panic,millis
+testdata\web-samples\samples\pptx\00024860.pptx,.pptx,false,false,0,0,zip: checksum error,,153

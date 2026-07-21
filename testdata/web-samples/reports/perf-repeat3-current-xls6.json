@@ -1,0 +1,124 @@
+{
+  "startedAt": "2026-07-05T14:04:28+08:00",
+  "finishedAt": "2026-07-05T14:05:24+08:00",
+  "inputs": [
+    "testdata\\web-samples\\samples\\xls\\008055.xls",
+    "testdata\\web-samples\\samples\\xls\\013623.xls",
+    "testdata\\web-samples\\samples\\xls\\016161.xls",
+    "testdata\\web-samples\\samples\\xls\\018548.xls",
+    "testdata\\web-samples\\samples\\xls\\019088.xls",
+    "testdata\\web-samples\\samples\\xls\\019089.xls"
+  ],
+  "summary": {
+    ".xls": {
+      "total": 6,
+      "ok": 6,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 29322326,
+      "images": 0,
+      "millis": 19093,
+      "maxMillis": 6847,
+      "over10Sec": 0
+    }
+  },
+  "files": [
+    {
+      "path": "testdata\\web-samples\\samples\\xls\\008055.xls",
+      "ext": ".xls",
+      "ok": true,
+      "empty": false,
+      "textBytes": 17684747,
+      "images": 0,
+      "millis": 6847,
+      "minMillis": 5847,
+      "maxMillis": 6873,
+      "runs": [
+        5847,
+        6847,
+        6873
+      ]
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\xls\\013623.xls",
+      "ext": ".xls",
+      "ok": true,
+      "empty": false,
+      "textBytes": 1329843,
+      "images": 0,
+      "millis": 2759,
+      "minMillis": 2464,
+      "maxMillis": 2836,
+      "runs": [
+        2464,
+        2759,
+        2836
+      ]
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\xls\\016161.xls",
+      "ext": ".xls",
+      "ok": true,
+      "empty": false,
+      "textBytes": 8179182,
+      "images": 0,
+      "millis": 3024,
+      "minMillis": 2947,
+      "maxMillis": 3104,
+      "runs": [
+        3024,
+        2947,
+        3104
+      ]
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\xls\\018548.xls",
+      "ext": ".xls",
+      "ok": true,
+      "empty": false,
+      "textBytes": 1541448,
+      "images": 0,
+      "millis": 2133,
+      "minMillis": 2018,
+      "maxMillis": 2194,
+      "runs": [
+        2018,
+        2133,
+        2194
+      ]
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\xls\\019088.xls",
+      "ext": ".xls",
+      "ok": true,
+      "empty": false,
+      "textBytes": 281048,
+      "images": 0,
+      "millis": 2161,
+      "minMillis": 2087,
+      "maxMillis": 2215,
+      "runs": [
+        2215,
+        2161,
+        2087
+      ]
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\xls\\019089.xls",
+      "ext": ".xls",
+      "ok": true,
+      "empty": false,
+      "textBytes": 306058,
+      "images": 0,
+      "millis": 2169,
+      "minMillis": 2066,
+      "maxMillis": 2275,
+      "runs": [
+        2169,
+        2275,
+        2066
+      ]
+    }
+  ]
+}

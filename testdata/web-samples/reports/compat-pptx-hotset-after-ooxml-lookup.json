@@ -1,0 +1,62 @@
+{
+  "startedAt": "2026-07-05T12:27:24+08:00",
+  "finishedAt": "2026-07-05T12:27:28+08:00",
+  "inputs": [
+    "testdata\\web-samples\\samples\\pptx\\00022381.pptx",
+    "testdata\\web-samples\\samples\\pptx\\00026428.pptx",
+    "testdata\\web-samples\\samples\\pptx\\00020725.pptx",
+    "testdata\\web-samples\\samples\\pptx\\406730.pptx"
+  ],
+  "summary": {
+    ".pptx": {
+      "total": 4,
+      "ok": 4,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 151057,
+      "images": 1121,
+      "millis": 4333,
+      "maxMillis": 1904,
+      "over10Sec": 0
+    }
+  },
+  "files": [
+    {
+      "path": "testdata\\web-samples\\samples\\pptx\\00020725.pptx",
+      "ext": ".pptx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 75992,
+      "images": 297,
+      "millis": 1003
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\pptx\\00022381.pptx",
+      "ext": ".pptx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 36730,
+      "images": 29,
+      "millis": 554
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\pptx\\00026428.pptx",
+      "ext": ".pptx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 24999,
+      "images": 58,
+      "millis": 872
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\pptx\\406730.pptx",
+      "ext": ".pptx",
+      "ok": true,
+      "empty": false,
+      "textBytes": 13336,
+      "images": 737,
+      "millis": 1904
+    }
+  ]
+}

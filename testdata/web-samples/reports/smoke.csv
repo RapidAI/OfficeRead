@@ -1,0 +1,13 @@
+path,ext,ok,empty,textBytes,images,error,panic,millis
+testdata\negative\35897-type4.xls,.xls,false,false,0,0,encrypted legacy Excel document is not supported,,0
+testdata\negative\42464-ExpPtg-bad.xls,.xls,true,false,11722,0,,,179
+testdata\negative\54764-2.xlsx,.xlsx,false,false,0,0,xml doctype is not supported,,0
+testdata\negative\54764.xlsx,.xlsx,false,false,0,0,xml doctype is not supported,,0
+testdata\negative\57272_corrupted_usereditatom.ppt,.ppt,true,false,563,2,,,11
+testdata\negative\Divino_Revelado.pptx,.pptx,false,false,0,0,zip: not a valid zip file,,0
+testdata\negative\ExternalEntityInText.docx,.docx,false,false,0,0,word/document.xml: xml doctype is not supported,,0
+testdata\negative\Fuzzed.doc,.doc,true,false,8602,14,,,116
+testdata\negative\MultipleCoreProperties.docx,.docx,true,false,232,0,,,4
+testdata\negative\PasswordProtected.doc,.doc,true,false,509,0,,,16
+testdata\negative\Password_Protected-56-hello.ppt,.ppt,true,false,312,0,,,14
+testdata\negative\clusterfuzz-testcase-minimized-POIFuzzer-5205835528404992.pptx,.pptx,false,false,0,0,zip: not a valid zip file,,0

@@ -1,0 +1,5 @@
+path,ext,ok,empty,textBytes,images,error,panic,millis
+testdata\web-samples\samples\doc\001538-2.doc,.doc,true,false,430692,0,,,78246
+testdata\web-samples\samples\doc\001538.doc,.doc,true,false,430692,0,,,79917
+testdata\web-samples\samples\doc\003336-2.doc,.doc,true,false,268880,0,,,31118
+testdata\web-samples\samples\doc\003336.doc,.doc,true,false,268880,0,,,37815

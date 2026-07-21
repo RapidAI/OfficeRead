@@ -1,0 +1,62 @@
+{
+  "startedAt": "2026-07-05T12:07:37+08:00",
+  "finishedAt": "2026-07-05T12:11:24+08:00",
+  "inputs": [
+    "testdata\\web-samples\\samples\\doc\\001538-2.doc",
+    "testdata\\web-samples\\samples\\doc\\001538.doc",
+    "testdata\\web-samples\\samples\\doc\\003336-2.doc",
+    "testdata\\web-samples\\samples\\doc\\003336.doc"
+  ],
+  "summary": {
+    ".doc": {
+      "total": 4,
+      "ok": 4,
+      "errors": 0,
+      "panics": 0,
+      "empty": 0,
+      "textBytes": 1399144,
+      "images": 0,
+      "millis": 227096,
+      "maxMillis": 79917,
+      "over10Sec": 4
+    }
+  },
+  "files": [
+    {
+      "path": "testdata\\web-samples\\samples\\doc\\001538-2.doc",
+      "ext": ".doc",
+      "ok": true,
+      "empty": false,
+      "textBytes": 430692,
+      "images": 0,
+      "millis": 78246
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\doc\\001538.doc",
+      "ext": ".doc",
+      "ok": true,
+      "empty": false,
+      "textBytes": 430692,
+      "images": 0,
+      "millis": 79917
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\doc\\003336-2.doc",
+      "ext": ".doc",
+      "ok": true,
+      "empty": false,
+      "textBytes": 268880,
+      "images": 0,
+      "millis": 31118
+    },
+    {
+      "path": "testdata\\web-samples\\samples\\doc\\003336.doc",
+      "ext": ".doc",
+      "ok": true,
+      "empty": false,
+      "textBytes": 268880,
+      "images": 0,
+      "millis": 37815
+    }
+  ]
+}
