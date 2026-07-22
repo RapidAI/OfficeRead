@@ -11,6 +11,8 @@ import (
 func main() {
 	imageDir := flag.String("images", "", "directory for extracted images")
 	includeMetadata := flag.Bool("metadata", false, "include document properties, relationships, and custom XML")
+	strictOfficeImages := flag.Bool("strict-office-images", false, "extract only images exposed by Microsoft Office picture shapes")
+	strictOfficeContent := flag.Bool("strict-office-content", false, "extract only primary document content exposed by Microsoft Office")
 	markdown := flag.Bool("markdown", false, "print markdown with image references")
 	textOnly := flag.Bool("text-only", false, "print text only")
 	flag.Parse()
@@ -21,7 +23,7 @@ func main() {
 	if *markdown && *imageDir == "" {
 		*imageDir = "images"
 	}
-	res, err := officeread.Extract(flag.Arg(0), officeread.Options{ImageDir: *imageDir, IncludeMetadata: *includeMetadata})
+	res, err := officeread.Extract(flag.Arg(0), officeread.Options{ImageDir: *imageDir, IncludeMetadata: *includeMetadata, StrictOfficeImages: *strictOfficeImages, StrictOfficeContent: *strictOfficeContent})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

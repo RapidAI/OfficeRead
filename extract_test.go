@@ -4085,6 +4085,21 @@ func TestPICTImagesAreValidatedTrimmedMaskedAndCarved(t *testing.T) {
 	}
 }
 
+func TestPICTImagesRejectVersionOpcodeFoundInBIFFData(t *testing.T) {
+	// This is shaped like a plausible frame and has the PICT v2 version opcode,
+	// but lacks the required extended PICT header.  It occurs in a text-only
+	// legacy XLS workbook and must not become a phantom image.
+	bad := make([]byte, 40)
+	binary.BigEndian.PutUint16(bad[6:], 888)
+	binary.BigEndian.PutUint16(bad[8:], 645)
+	copy(bad[10:], []byte{0x00, 0x11, 0x02, 0xff, 0x0c, 0x00, 0xff, 0xff})
+	bad[len(bad)-2] = 0x00
+	bad[len(bad)-1] = 0xff
+	if validPICTData(bad) || len(carveImages(bad)) != 0 {
+		t.Fatal("invalid PICT-like BIFF data was accepted as an image")
+	}
+}
+
 func TestLegacyNamedPICTStreamsAreExtracted(t *testing.T) {
 	pict := testPICT(true)
 	streams := []oleStream{
@@ -15731,6 +15746,69 @@ func TestPPTXVisibleSlideTransitiveMediaIsExtracted(t *testing.T) {
 	}
 }
 
+func TestStrictPPTXImagesExcludeOLEPreviewAndLayoutMedia(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	addZip(t, zw, "[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`)
+	addZip(t, zw, "ppt/presentation.xml", `<p:presentation xmlns:p="urn:p" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId r:id="rId1"/></p:sldIdLst></p:presentation>`)
+	addZip(t, zw, "ppt/_rels/presentation.xml.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>`)
+	addZip(t, zw, "ppt/slides/slide1.xml", `<p:sld xmlns:p="urn:p" xmlns:a="urn:a" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><p:pic><p:nvPicPr><p:cNvPr id="1" name="Visible"/></p:nvPicPr><p:blipFill><a:blip r:embed="rIdVisible"/></p:blipFill></p:pic><p:oleObj r:id="rIdOLE"><p:pic><p:blipFill><a:blip r:embed="rIdPreview"/></p:blipFill></p:pic></p:oleObj></p:spTree></p:cSld></p:sld>`)
+	addZip(t, zw, "ppt/slides/_rels/slide1.xml.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdVisible" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/visible.png"/><Relationship Id="rIdPreview" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/ole-preview.png"/><Relationship Id="rIdOLE" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="../embeddings/object.bin"/><Relationship Id="rIdLayout" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>`)
+	addZip(t, zw, "ppt/slideLayouts/slideLayout1.xml", `<p:sldLayout xmlns:p="urn:p"/>`)
+	addZip(t, zw, "ppt/slideLayouts/_rels/slideLayout1.xml.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdLayoutImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/layout.png"/></Relationships>`)
+	addZipBytes(t, zw, "ppt/media/visible.png", testPNG())
+	addZipBytes(t, zw, "ppt/media/ole-preview.png", testPNG())
+	addZipBytes(t, zw, "ppt/media/layout.png", testPNG())
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]*zip.File{}
+	for _, f := range r.File {
+		files[f.Name] = f
+	}
+	media, ok := strictPptxVisibleMediaParts(files)
+	if !ok || len(media) != 1 || !media["ppt/media/visible.png"] {
+		t.Fatalf("strict PowerPoint media = %#v, ok=%v; want visible picture only", media, ok)
+	}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "strict-images.pptx")
+	if err := os.WriteFile(file, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Extract(file, Options{StrictOfficeImages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Images) != 1 || res.Images[0].Name != "visible.png" {
+		t.Fatalf("strict Extract images = %#v, want visible.png only", res.Images)
+	}
+	compatible, err := Extract(file, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(compatible.Images) < len(res.Images) {
+		t.Fatalf("default compatibility extraction unexpectedly lost images: strict=%d compatible=%d", len(res.Images), len(compatible.Images))
+	}
+}
+
+func TestStrictPPTXWebSampleMatchesPowerPointPictureCount(t *testing.T) {
+	file := filepath.Join("testdata", "web-samples", "samples", "pptx", "00020011.pptx")
+	res, err := Extract(file, Options{StrictOfficeImages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Office COM exposes four msoPicture/msoLinkedPicture shapes for this
+	// presentation. The package also contains layout artwork and an OLE preview,
+	// which are intentionally excluded by StrictOfficeImages.
+	if len(res.Images) != 4 {
+		t.Fatalf("strict PPTX image count = %d, want 4 (PowerPoint Picture Shapes)", len(res.Images))
+	}
+}
+
 func TestPPTXHiddenShapeImagesAreNotExtracted(t *testing.T) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
@@ -17615,10 +17693,15 @@ func testTGARLE() []byte {
 }
 
 func testPICT(wrapped bool) []byte {
-	raw := make([]byte, 18)
+	raw := make([]byte, 40)
 	binary.BigEndian.PutUint16(raw[6:], 2)
 	binary.BigEndian.PutUint16(raw[8:], 2)
-	copy(raw[10:], []byte{0x00, 0x11, 0x02, 0xff, 'A', 'B', 0x00, 0xff})
+	copy(raw[10:], []byte{0x00, 0x11, 0x02, 0xff, 0x0c, 0x00, 0xff, 0xfe})
+	binary.BigEndian.PutUint32(raw[18:], 0x00480000)
+	binary.BigEndian.PutUint32(raw[22:], 0x00480000)
+	binary.BigEndian.PutUint16(raw[30:], 2)
+	binary.BigEndian.PutUint16(raw[32:], 2)
+	raw[38], raw[39] = 0x00, 0xff
 	if !wrapped {
 		return raw
 	}

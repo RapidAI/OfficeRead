@@ -28,6 +28,10 @@ func cleanText(s string) string {
 	}
 	s = decodeOOXMLTextEscapes(s)
 	s = strings.Map(cleanTextRune, s)
+	// 鎼?is an internal sentinel for the legacy Word possessive mojibake handled
+	// by cleanTextRune. Expand it only after rune cleanup so ordinary Unicode
+	// text is never mistaken for the sentinel.
+	s = strings.ReplaceAll(s, "\uE000", "'s")
 	s = spaceRE.ReplaceAllString(s, " ")
 	lines := strings.Split(s, "\n")
 	for i := range lines {
@@ -476,6 +480,13 @@ func cleanTextRune(r rune) rune {
 	}
 	if isInvisibleFormatControlRune(r) {
 		return -1
+	}
+	// Legacy Word's single-byte apostrophe/footnote control can be decoded as
+	// this unrelated Hangul syllable when a compressed piece is read through a
+	// mixed code page. It is not document text and otherwise glues to a word
+	// (for example, "Commission鎴?policy") instead of the visible possessive.
+	if r == '\ubb69' {
+		return '\uE000'
 	}
 	if r == '\r' {
 		return '\n'
@@ -1208,7 +1219,6 @@ func repairWindows1252UTF8MojibakePunctuationLine(s string) string {
 	s = replacer.Replace(s)
 	return strings.TrimSpace(s)
 }
-
 func countHighBytes(raw []byte) int {
 	var n int
 	for _, b := range raw {
@@ -2832,7 +2842,12 @@ func pictDeclaredSize(b []byte) (int, bool) {
 }
 
 func rawPICTDeclaredSize(b []byte) (int, bool) {
-	if len(b) < 16 || !bytes.Equal(b[10:14], []byte{0x00, 0x11, 0x02, 0xff}) {
+	// A PICT v2 stream starts with its frame followed by the version opcode and
+	// the mandatory extended-header opcode/version.  Merely finding the version
+	// opcode is too weak: BIFF/Escher data can contain that byte sequence by
+	// chance (notably in otherwise text-only .xls files).
+	if len(b) < 40 || !bytes.Equal(b[10:14], []byte{0x00, 0x11, 0x02, 0xff}) ||
+		!bytes.Equal(b[14:18], []byte{0x0c, 0x00, 0xff, 0xfe}) {
 		return 0, false
 	}
 	top := int(int16(binary.BigEndian.Uint16(b[2:])))

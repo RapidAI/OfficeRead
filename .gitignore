@@ -9,6 +9,8 @@
 extract-output/
 images/
 tmp-shape/
+testdata/baseline-*.json
+testdata/pptx-images/
 
 # Python bytecode
 __pycache__/

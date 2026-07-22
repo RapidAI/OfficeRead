@@ -96,6 +96,21 @@ Compatibility report helper:
 go run ./cmd/compatcheck -jobs 4 -markdown -json compat-report.json -csv compat-report.csv testdata/samples
 ```
 
+Microsoft Office quality baseline (Windows only; requires locally installed desktop Office):
+
+```powershell
+go run ./cmd/officebaseline `
+  -limit 50 `
+  -min-recall 0.95 `
+  -min-precision 0.90 `
+  -json office-baseline-report.json `
+  testdata/web-samples/samples
+```
+
+This test-only command opens files read-only through Word, PowerPoint, and Excel COM automation with macros disabled, then compares their visible text tokens and picture-shape counts to `officeread`. It reports token recall (content Office exposes that was retained), precision (extracted content Office also exposes), F1, and image-count deltas. Keep the thresholds per format and sample corpus: Office's object model represents a few content types differently from the package-level extractor.
+
+`officebaseline` enables `StrictOfficeImages` and `StrictOfficeContent`. The former makes PPTX image comparison follow PowerPoint Picture Shapes (excluding layout/master artwork and OLE previews); the latter limits OOXML text to Office's primary document content, excluding cached chart/drawing data. The regular API and CLI retain compatibility-oriented recovery by default; opt in with `-strict-office-images` and `-strict-office-content` when exact Office semantics are required.
+
 ### API
 
 ```go
@@ -269,6 +284,16 @@ go run ./cmd/extracttest -out extract-output testdata/samples
 ```bash
 go run ./cmd/compatcheck -jobs 4 -markdown -json compat-report.json -csv compat-report.csv testdata/samples
 ```
+
+Microsoft Office 对照测试（仅 Windows，需安装桌面版 Office）：
+
+```powershell
+go run ./cmd/officebaseline -limit 50 -min-recall 0.95 -min-precision 0.90 -json office-baseline-report.json testdata/web-samples/samples
+```
+
+该测试工具通过 Word、PowerPoint 和 Excel COM 以只读、禁宏方式打开文档，对照 Office 可见文本 token 与图片形状数量，报告召回率、精确率、F1 和图片数量差异；阈值应按格式与样本集分别设定。
+
+对照工具会启用 `StrictOfficeImages` 与 `StrictOfficeContent`：前者使 PPTX 图片以 PowerPoint Picture Shape 语义提取，排除母版/布局图片及 OLE 预览图；后者使 OOXML 文本仅保留 Office 主文档内容，排除图表/绘图缓存。常规 API/CLI 默认仍保留兼容性恢复策略；如需严格 Office 语义，可使用 `-strict-office-images` 与 `-strict-office-content`。
 
 ### API 文档
 

@@ -54,9 +54,9 @@ func extractOOXMLWithDepth(filename string, data []byte, depth int, opts Options
 	var xlsxMarkdown map[string]xlsxWorksheetMarkdownData
 	switch kind {
 	case "docx":
-		texts, err = extractDocxText(files)
+		texts, err = extractDocxText(files, opts.StrictOfficeContent)
 	case "pptx":
-		texts, err = extractPptxText(files)
+		texts, err = extractPptxText(files, opts.StrictOfficeImages)
 	case "xlsx":
 		text, xlsxMarkdown, err = extractXlsxText(files)
 	default:
@@ -82,7 +82,7 @@ func extractOOXMLWithDepth(filename string, data []byte, depth int, opts Options
 		}
 		texts = append(texts, custom...)
 	}
-	images, err := extractOOXMLImages(files, kind, opts.IncludeMetadata)
+	images, err := extractOOXMLImages(files, kind, opts.IncludeMetadata, opts.StrictOfficeImages)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +95,9 @@ func extractOOXMLWithDepth(filename string, data []byte, depth int, opts Options
 	if depth < maxOOXMLEmbeddedDepth {
 		var embeddedImages []Image
 		embeddedText, embeddedMarkdown, embeddedImages = extractEmbeddedOfficePackages(files, kind, depth+1, opts)
-		texts = append(texts, embeddedText...)
+		if !opts.StrictOfficeContent {
+			texts = append(texts, embeddedText...)
+		}
 		images = append(images, embeddedImages...)
 	}
 	uniquifyImageNames(images)
@@ -318,7 +320,7 @@ func ooxmlHasSuffix(name, suffix string) bool {
 	return strings.HasSuffix(ooxmlPartKey(name), strings.ToLower(suffix))
 }
 
-func extractDocxText(files map[string]*zip.File) ([]string, error) {
+func extractDocxText(files map[string]*zip.File, strictOfficeContent bool) ([]string, error) {
 	visibleRelated, constrainedRelated := docxVisibleRelatedTextParts(files)
 	visibleHeaderFooter, _, constrainedHeaderFooter := docxVisibleHeaderFooterParts(files)
 	var names []string
@@ -329,14 +331,17 @@ func extractDocxText(files map[string]*zip.File) ([]string, error) {
 		}
 		if strings.HasPrefix(lower, "word/") && strings.HasSuffix(lower, ".xml") {
 			base := path.Base(lower)
-			if base == "document.xml" || base == "footnotes.xml" || base == "endnotes.xml" || base == "comments.xml" ||
-				(isDocxHeaderFooterPart(lower) && (!constrainedHeaderFooter || visibleHeaderFooter[lower])) {
+			if base == "document.xml" || (!strictOfficeContent && isDocxHeaderFooterPart(lower) && (!constrainedHeaderFooter || visibleHeaderFooter[lower])) {
 				if base == "footnotes.xml" || base == "endnotes.xml" || base == "comments.xml" {
 					continue
 				}
 				names = append(names, name)
 			}
-			if docxRelatedTextPart(lower) && (!constrainedRelated || visibleRelated[lower]) {
+			// Word.Document.Content.Text returns document-story text, not cached
+			// chart/SmartArt data exposed through a drawing relationship. Keep
+			// the latter in compatibility mode, but omit it for Office-COM
+			// comparison mode.
+			if !strictOfficeContent && docxRelatedTextPart(lower) && (!constrainedRelated || visibleRelated[lower]) {
 				names = append(names, name)
 			}
 		}
@@ -349,21 +354,23 @@ func extractDocxText(files map[string]*zip.File) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, part := range []struct {
-		name     string
-		item     string
-		refLocal string
-	}{
-		{name: "word/footnotes.xml", item: "footnote", refLocal: "footnoteReference"},
-		{name: "word/endnotes.xml", item: "endnote", refLocal: "endnoteReference"},
-		{name: "word/comments.xml", item: "comment", refLocal: "commentReference"},
-	} {
-		text, err := docxVisibleReferencedPartText(files, part.name, part.item, part.refLocal)
-		if err != nil {
-			return nil, err
-		}
-		if text != "" {
-			out = append(out, text)
+	if !strictOfficeContent {
+		for _, part := range []struct {
+			name     string
+			item     string
+			refLocal string
+		}{
+			{name: "word/footnotes.xml", item: "footnote", refLocal: "footnoteReference"},
+			{name: "word/endnotes.xml", item: "endnote", refLocal: "endnoteReference"},
+			{name: "word/comments.xml", item: "comment", refLocal: "commentReference"},
+		} {
+			text, err := docxVisibleReferencedPartText(files, part.name, part.item, part.refLocal)
+			if err != nil {
+				return nil, err
+			}
+			if text != "" {
+				out = append(out, text)
+			}
 		}
 	}
 	htmlNames, err := docxVisibleHTMLPartNames(files)
@@ -1520,7 +1527,7 @@ func docxAltChunkRelationshipIDs(files map[string]*zip.File, part string) ([]str
 	return ids, nil
 }
 
-func extractPptxText(files map[string]*zip.File) ([]string, error) {
+func extractPptxText(files map[string]*zip.File, strictOfficeContent ...bool) ([]string, error) {
 	visibleNotes, err := pptxVisibleNotesSlideNames(files)
 	if err != nil {
 		return nil, err
@@ -1543,6 +1550,9 @@ func extractPptxText(files map[string]*zip.File) ([]string, error) {
 		if visible {
 			names = append(names, name)
 		}
+	}
+	if len(strictOfficeContent) > 0 && strictOfficeContent[0] {
+		return xmlTextFromFiles(files, names)
 	}
 	for name := range files {
 		lower := ooxmlPartKey(name)
@@ -2480,6 +2490,10 @@ func extractXlsxText(files map[string]*zip.File) (string, map[string]xlsxWorkshe
 	if err != nil {
 		return "", nil, err
 	}
+	styles, err := readXlsxCellStyles(files)
+	if err != nil {
+		return "", nil, err
+	}
 	var out strings.Builder
 	markdown := map[string]xlsxWorksheetMarkdownData{}
 	workbookTexts, sheetNames, err := workbookTextAndSheets(files)
@@ -2505,7 +2519,7 @@ func extractXlsxText(files map[string]*zip.File) (string, map[string]xlsxWorkshe
 			return "", nil, err
 		}
 		var md xlsxWorksheetMarkdownData
-		if err := appendWorksheetText(&out, b, shared, &md); err != nil {
+		if err := appendWorksheetText(&out, b, shared, styles, &md); err != nil {
 			return "", nil, err
 		}
 		markdown[ooxmlPartKey(name)] = md
@@ -5787,7 +5801,27 @@ func isDrawingObjectElement(name string) bool {
 }
 
 func drawingObjectElementHidden(start xml.StartElement) bool {
-	return vmlElementHidden(start)
+	if vmlElementHidden(start) {
+		return true
+	}
+	// Word VML text boxes may be sent behind the document text with a negative
+	// z-index. They are still present in document.xml but are not exposed by
+	// Document.Content.Text; treating them as visible leaks background template
+	// captions into strict Office-content extraction.
+	for _, attr := range start.Attr {
+		if attr.Name.Local != "style" {
+			continue
+		}
+		for _, declaration := range strings.Split(strings.ToLower(attr.Value), ";") {
+			key, value, ok := strings.Cut(strings.TrimSpace(declaration), ":")
+			if ok && strings.TrimSpace(key) == "z-index" {
+				if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && (n < 0 || n >= 251658240) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func isHiddenRevisionElement(name xml.Name) bool {
@@ -8475,15 +8509,94 @@ func isExcelPhoneticElement(name string) bool {
 	}
 }
 
-func appendWorksheetText(out *strings.Builder, b []byte, shared []string, md *xlsxWorksheetMarkdownData) error {
-	if ok, err := appendSimpleInlineWorksheetText(out, b, md); ok || err != nil {
-		return err
+type xlsxCellStyles []string
+
+func readXlsxCellStyles(files map[string]*zip.File) (xlsxCellStyles, error) {
+	f := ooxmlFile(files, "xl/styles.xml")
+	if f == nil {
+		return nil, nil
 	}
-	if ok, err := appendSharedStringWorksheetText(out, b, shared, md); ok || err != nil {
-		return err
+	b, err := readZipFile(f)
+	if err != nil {
+		return nil, err
+	}
+	if hasDOCTYPE(b) {
+		return nil, errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	var styles xlsxCellStyles
+	inCellXfs := false
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "cellXfs" {
+				inCellXfs = true
+				continue
+			}
+			if !inCellXfs || t.Name.Local != "xf" {
+				continue
+			}
+			id := "0"
+			for _, a := range t.Attr {
+				if a.Name.Local == "numFmtId" {
+					id = a.Value
+					break
+				}
+			}
+			styles = append(styles, id)
+		case xml.EndElement:
+			if t.Name.Local == "cellXfs" {
+				inCellXfs = false
+			}
+		}
+	}
+	return styles, nil
+}
+
+func xlsxDisplayNumber(value, style string) string {
+	if style == "" || !plainExcelNumberValue(value) {
+		return value
+	}
+	n, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return value
+	}
+	// General formats (built-in 0 and the custom General used by several
+	// writers) suppress floating-point storage residue in Excel's .Text.
+	if style == "0" || style == "82" {
+		return strconv.FormatFloat(n, 'g', 14, 64)
+	}
+	return value
+}
+
+func xlsxDisplayNumberForCell(value string, styleIndex int, styles xlsxCellStyles) string {
+	if styleIndex < 0 || styleIndex >= len(styles) {
+		return value
+	}
+	return xlsxDisplayNumber(value, styles[styleIndex])
+}
+
+func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles xlsxCellStyles, md *xlsxWorksheetMarkdownData) error {
+	// The fast paths do not parse cell styles. Use the XML reader whenever a
+	// workbook has styles so numeric cells can match Excel's displayed value.
+	if len(styles) == 0 {
+		if ok, err := appendSimpleInlineWorksheetText(out, b, md); ok || err != nil {
+			return err
+		}
+		if ok, err := appendSharedStringWorksheetText(out, b, shared, md); ok || err != nil {
+			return err
+		}
 	}
 	dec := xml.NewDecoder(bytes.NewReader(b))
 	var cellType string
+	cellStyle := -1
 	var inV, inT bool
 	var inHeaderFooter bool
 	var rowHidden bool
@@ -8541,6 +8654,7 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, md *xl
 			if t.Name.Local == "c" {
 				cellDepth = 1
 				cellType = ""
+				cellStyle = -1
 				cellRef := ""
 				collectMarkdownCell = false
 				for _, a := range t.Attr {
@@ -8549,6 +8663,10 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, md *xl
 						cellType = a.Value
 					case "r":
 						cellRef = a.Value
+					case "s":
+						if n, ok := atoi(a.Value); ok {
+							cellStyle = n
+						}
 					}
 				}
 				if col, _, ok := cellRefIndexes(cellRef); ok {
@@ -8650,6 +8768,10 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, md *xl
 						markdownValue = value
 					case t.Name.Local == "t" && cellType == "inlineStr":
 						markdownValue = rawValue
+					}
+					if t.Name.Local == "v" && cellType == "" {
+						value = xlsxDisplayNumberForCell(value, cellStyle, styles)
+						markdownValue = value
 					}
 					if !skipValue {
 						if t.Name.Local == "v" && cellType == "" && plainExcelNumberValue(value) {
@@ -10215,7 +10337,7 @@ func isASCIIHex(b byte) bool {
 	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
-func extractOOXMLImages(files map[string]*zip.File, kind string, includeMetadata bool) ([]Image, error) {
+func extractOOXMLImages(files map[string]*zip.File, kind string, includeMetadata bool, strictOfficeImages ...bool) ([]Image, error) {
 	var prefix string
 	switch kind {
 	case "docx":
@@ -10234,6 +10356,10 @@ func extractOOXMLImages(files map[string]*zip.File, kind string, includeMetadata
 		}
 	}
 	visibleMedia, filterMedia := visibleOOXMLMediaParts(files, kind)
+	strict := len(strictOfficeImages) > 0 && strictOfficeImages[0]
+	if strict && kind == "pptx" {
+		visibleMedia, filterMedia = strictPptxVisibleMediaParts(files)
+	}
 	sort.Strings(names)
 	altData := ooxmlVisibleImageAltData(files, kind)
 	altsByMedia := altData.byMedia
@@ -10910,12 +11036,52 @@ func pptxVisibleMediaParts(files map[string]*zip.File) (map[string]bool, bool) {
 	if !foundRels {
 		return nil, false
 	}
-	if len(hidden) == 0 {
-		return visible, true
-	}
 	for name := range hidden {
 		if !visible[name] {
 			delete(visible, name)
+		}
+	}
+	return visible, true
+}
+
+// strictPptxVisibleMediaParts follows PowerPoint's Picture Shape model. It
+// accepts direct p:pic references on visible slides and chart-owned artwork,
+// while deliberately excluding master/layout resources and OLE previews.
+func strictPptxVisibleMediaParts(files map[string]*zip.File) (map[string]bool, bool) {
+	visible := map[string]bool{}
+	slides, _, err := pptxCandidateSlideNames(files)
+	if err != nil || len(slides) == 0 {
+		return nil, false
+	}
+	for _, slide := range slides {
+		ok, err := pptxSlideVisible(files, slide)
+		if err != nil || !ok {
+			continue
+		}
+		f := ooxmlFile(files, slide)
+		if f == nil {
+			return nil, false
+		}
+		b, err := readZipFile(f)
+		if err != nil {
+			return nil, false
+		}
+		refs, err := pptxPictureRelationshipRefs(b)
+		if err != nil {
+			return nil, false
+		}
+		rels, err := relationshipTargetMapForPart(files, slide)
+		if err != nil {
+			return nil, false
+		}
+		for id := range refs.Visible {
+			collectRelationshipTargetMedia(files, slide, rels[id], "ppt/media/", visible)
+		}
+		for _, target := range rels {
+			part := resolveOOXMLRelationshipTarget(slide, target)
+			if strings.Contains(strings.ToLower(ooxmlPartKey(part)), "ppt/charts/") {
+				collectReachableOOXMLMedia(files, part, "ppt/media/", visible, map[string]bool{})
+			}
 		}
 	}
 	return visible, true
@@ -10930,8 +11096,10 @@ func collectPptxSlideVisibleMedia(files map[string]*zip.File, slide string, visi
 	if err != nil {
 		return collectReachableOOXMLMedia(files, slide, "ppt/media/", visible, map[string]bool{})
 	}
-	refs, err := docxImageRelationshipRefs(b)
+	refs, err := pptxPictureRelationshipRefs(b)
 	if err != nil || (len(refs.Visible) == 0 && len(refs.Hidden) == 0) {
+		// Some producers omit the DrawingML picture markup. Preserve the
+		// recovery path for such malformed packages.
 		return collectReachableOOXMLMedia(files, slide, "ppt/media/", visible, map[string]bool{})
 	}
 	rels, err := relationshipTargetMapForPart(files, slide)
@@ -10953,6 +11121,66 @@ func collectPptxSlideVisibleMedia(files map[string]*zip.File, slide string, visi
 		return collectReachableOOXMLMedia(files, slide, "ppt/media/", visible, map[string]bool{})
 	}
 	return true
+}
+
+// pptxPictureRelationshipRefs accepts only DrawingML picture shapes. A slide
+// relationship can also target layout artwork or an OLE preview; those payloads
+// are not entries in PowerPoint's visible Picture Shapes collection.
+func pptxPictureRelationshipRefs(b []byte) (docxImageRefs, error) {
+	refs := docxImageRefs{Visible: map[string]bool{}, Hidden: map[string]bool{}}
+	if hasDOCTYPE(b) {
+		return refs, errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	pictureDepth := 0
+	pictureHidden := false
+	oleObjectDepth := 0
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return refs, nil
+		}
+		if err != nil {
+			return refs, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "oleObj" {
+				oleObjectDepth++
+			}
+			if t.Name.Local == "pic" {
+				if oleObjectDepth == 0 && pictureDepth == 0 {
+					pictureHidden = false
+				}
+				if oleObjectDepth == 0 {
+					pictureDepth++
+				}
+			}
+			if pictureDepth == 0 {
+				continue
+			}
+			if drawingObjectElementHidden(t) {
+				pictureHidden = true
+			}
+			for _, id := range imageRelationshipIDs(t) {
+				if pictureHidden {
+					refs.Hidden[id] = true
+				} else {
+					refs.Visible[id] = true
+				}
+			}
+		case xml.EndElement:
+			if t.Name.Local == "pic" && pictureDepth > 0 {
+				pictureDepth--
+				if pictureDepth == 0 {
+					pictureHidden = false
+				}
+			}
+			if t.Name.Local == "oleObj" && oleObjectDepth > 0 {
+				oleObjectDepth--
+			}
+		}
+	}
 }
 
 func collectRelationshipTargetMedia(files map[string]*zip.File, source, target, mediaPrefix string, media map[string]bool) bool {
@@ -11948,19 +12176,16 @@ func extractEmbeddedOfficePackages(files map[string]*zip.File, kind string, dept
 		case isOLE(b):
 			legacyName, ok := embeddedLegacyFilename(name, b)
 			if !ok {
+				// A generic OLE payload is represented by Office as an embedded
+				// object, not a visible picture. Do not promote preview bytes from
+				// it to document images; this keeps the visible-image contract
+				// aligned with Word/PowerPoint/Excel.
 				if streams, streamErr := readOLEStreams(b); streamErr == nil {
 					res = extractOfficePackagesFromOLEStreams(name, streams, depth, opts)
-					if res != nil {
-						break
-					}
 				}
-				for _, img := range extractNonOfficeOLEImages(name, b, len(images)) {
-					if img.Name != "" {
-						img.Name = uniqueImageFilename(img.Name, usedImageNames)
-					}
-					images = append(images, img)
+				if res == nil {
+					continue
 				}
-				continue
 			}
 			res, err = extractLegacyWithDepth(legacyName, b, depth, opts)
 		default:

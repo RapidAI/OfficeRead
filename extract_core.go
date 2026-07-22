@@ -25,6 +25,7 @@ const maxImageFilenameBytes = 180
 const maxMarkdownTableRows = 50000
 const maxMarkdownTableCols = 1024
 const maxMarkdownTableCellBytes = 512 << 10
+const maxBIFFStoredTableRows = 50000
 const maxHiddenResourceMetadataReferenceBytes = 8192
 const markdownIndentMarker = "\ue000"
 const minMarkdownVisibleShortDigitBytes = 1 << 20
@@ -46,8 +47,12 @@ type Image struct {
 }
 
 type Options struct {
-	ImageDir        string
-	IncludeMetadata bool
+	ImageDir           string
+	IncludeMetadata    bool
+	StrictOfficeImages bool
+	// StrictOfficeContent limits OOXML text to what Office's primary document
+	// content API exposes, excluding cached drawing/chart data.
+	StrictOfficeContent bool
 }
 
 func Extract(filename string, opts Options) (*Result, error) {
@@ -708,7 +713,19 @@ func markdownImage(img Image, imageBase, name string, index int) string {
 }
 
 func appendMissingMarkdownText(markdown, text string, images []Image) string {
-	missing := missingMarkdownText(markdown, text, images)
+	coverageMarkdown := markdown
+	// Legacy Word's structured Markdown deliberately preserves readable note
+	// anchors, while its COM-aligned Result.Text omits them. Limit this
+	// normalization to legacy note sections; doing it for every document can
+	// change ordinary Markdown link and citation coverage.
+	if (strings.Contains(markdown, "## Footnotes and Endnotes") || strings.Contains(markdown, "## Comments")) &&
+		(strings.Contains(markdown, "[footnote]") || strings.Contains(markdown, "[comment]")) {
+		coverageMarkdown = strings.ReplaceAll(coverageMarkdown, "[footnote]", "")
+		coverageMarkdown = strings.ReplaceAll(coverageMarkdown, "[comment]", "")
+		text = strings.ReplaceAll(text, "[footnote]", "")
+		text = strings.ReplaceAll(text, "[comment]", "")
+	}
+	missing := missingMarkdownText(coverageMarkdown, text, images)
 	if missing == "" {
 		return strings.TrimSpace(markdown)
 	}

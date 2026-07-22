@@ -318,7 +318,7 @@ func benchmarkXLSXWorksheetTextSampleFile(b *testing.B, samplePath string) {
 	for i := 0; i < b.N; i++ {
 		var out strings.Builder
 		md := xlsxWorksheetMarkdownData{}
-		if err := appendWorksheetText(&out, worksheetBytes, shared, &md); err != nil {
+		if err := appendWorksheetText(&out, worksheetBytes, shared, nil, &md); err != nil {
 			b.Fatalf("%s: %v", samplePath, err)
 		}
 		benchmarkStringResult = out.String()
@@ -365,7 +365,7 @@ func benchmarkXLSXWorksheetTextNoMarkdownSampleFile(b *testing.B, samplePath str
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var out strings.Builder
-		if err := appendWorksheetText(&out, worksheetBytes, shared, nil); err != nil {
+		if err := appendWorksheetText(&out, worksheetBytes, shared, nil, nil); err != nil {
 			b.Fatalf("%s: %v", samplePath, err)
 		}
 		benchmarkStringResult = out.String()

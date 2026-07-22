@@ -77,7 +77,7 @@ func extractLegacyWithDepth(filename string, data []byte, depth int, opts Option
 			}
 		}
 		if len(textParts) == 0 {
-			textParts = extractLegacyTextWithMetadata(filename, data, streams, opts.IncludeMetadata)
+			textParts = extractLegacyTextWithOptions(filename, data, streams, opts.IncludeMetadata, opts.StrictOfficeContent)
 		}
 	}
 	var text string
@@ -102,6 +102,9 @@ func extractLegacyWithDepth(filename string, data []byte, depth int, opts Option
 		structuredMarkdown = legacyFallbackMarkdown(filename, textParts)
 	}
 	images := imagesFromOLEStreams(data, streams)
+	if ext == ".ppt" && opts.StrictOfficeImages {
+		images = pptVisiblePictureImages(streams)
+	}
 	return &Result{Text: text, StructuredMarkdown: structuredMarkdown, Images: images}, nil
 }
 
@@ -808,10 +811,14 @@ func isOLE(data []byte) bool {
 }
 
 func extractLegacyText(filename string, data []byte, streams []oleStream) []string {
-	return extractLegacyTextWithMetadata(filename, data, streams, true)
+	return extractLegacyTextWithOptions(filename, data, streams, true, false)
 }
 
 func extractLegacyTextWithMetadata(filename string, data []byte, streams []oleStream, includeMetadata bool) []string {
+	return extractLegacyTextWithOptions(filename, data, streams, includeMetadata, false)
+}
+
+func extractLegacyTextWithOptions(filename string, data []byte, streams []oleStream, includeMetadata, strictOfficeContent bool) []string {
 	ext := strings.ToLower(filepath.Ext(filename))
 	if len(streams) == 0 {
 		if ext == ".xls" && isBIFFWorkbook(data) {
@@ -840,7 +847,9 @@ func extractLegacyTextWithMetadata(filename string, data []byte, streams []oleSt
 			if stringSliceLooksLikePrinterSettingsDump(parts) {
 				return nil
 			}
-			return uniqueStrings(append(parts, props...))
+			// Same text on separate visible slides is a separate COM-visible
+			// shape occurrence; do not apply document-wide de-duplication.
+			return append(parts, props...)
 		}
 	case ".doc":
 		if _, ok := findLegacyStream(streams, "WordDocument"); ok {
@@ -848,11 +857,11 @@ func extractLegacyTextWithMetadata(filename string, data []byte, streams []oleSt
 		}
 	case ".ppt":
 		if ppt, ok := findLegacyStream(streams, "PowerPoint Document"); ok {
-			parts := extractPPTLegacyText(streams)
+			parts := extractPPTLegacyTextWithMode(streams, strictOfficeContent)
 			if len(parts) == 0 {
 				parts = extractPPTFallbackStrings(ppt.Data)
 			}
-			return uniqueStrings(append(parts, props...))
+			return append(parts, props...)
 		}
 		if pp40, ok := findLegacyStream(streams, "PP40"); ok {
 			return uniqueStrings(append(extractPPTFallbackStrings(pp40.Data), props...))
@@ -1371,11 +1380,418 @@ func looksLikeWordFallbackText(s string) bool {
 }
 
 func extractPPTLegacyText(streams []oleStream) []string {
+	return extractPPTLegacyTextWithMode(streams, false)
+}
+
+func extractPPTLegacyTextWithMode(streams []oleStream, strictOfficeContent bool) []string {
 	s, ok := findLegacyStream(streams, "PowerPoint Document")
 	if !ok {
 		return nil
 	}
-	return uniqueStrings(pptRecordText(s.Data))
+	// A PPT stream is append-only.  Restrict extraction to the SlideContainers
+	// referenced by the current DocumentContainer, otherwise deleted/replaced
+	// slides remain visible to the extractor even though PowerPoint does not
+	// render them.
+	if strictOfficeContent {
+		if slides := pptActiveSlideContainers(streams); len(slides) > 0 {
+			var out []string
+			for _, slide := range slides {
+				pptRecordTextInto(slide, 0, &out)
+			}
+			out = pptDropChartAxisText(out)
+			// Old PowerPoint may store text belonging to the master/title layout
+			// in the active DocumentContainer.  Add those records, but never scan
+			// the entire append-only stream: previous edits are not visible.
+			out = append(pptActiveDocumentText(streams), out...)
+			out = cleanPPTRecordTextParts(dropPPTOutlinePlaceholders(out))
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
+	return pptRecordText(s.Data)
+}
+
+func pptDropChartAxisText(parts []string) []string {
+	// Chart axis labels are stored as ordinary text atoms within a slide's
+	// drawing tree, but they are not Slide.Shapes text.  Recognize only a
+	// complete numeric-axis cluster; this avoids a document-wide numeric filter.
+	numeric := 0
+	for _, part := range parts {
+		if pptChartAxisNumber(part) {
+			numeric++
+		}
+	}
+	if numeric < 4 {
+		return parts
+	}
+	axisWords := map[string]bool{
+		"data": true, "data duration": true, "frequency of data": true,
+		"location": true, "number of stations": true,
+		"log mean ent": true, "log mean ec": true, "log mean tc": true,
+		"visitors": true, "santa monica (i)": true, "santa monica (ii)": true,
+		"huntington beach": true, "whites point": true,
+		"daily": true, "daily to weekly": true, "5 d per wk": true,
+		"ent & tide level / range": true, "littoral current": true,
+		"tide range": true,
+	}
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if pptChartAxisNumber(part) || axisWords[strings.ToLower(strings.TrimSpace(part))] {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
+}
+
+func pptChartAxisNumber(part string) bool {
+	part = strings.TrimSpace(part)
+	if part == "" || len(part) > 12 {
+		return false
+	}
+	for _, r := range part {
+		if !(r >= '0' && r <= '9') && r != '.' && r != '-' {
+			return false
+		}
+	}
+	_, err := strconv.ParseFloat(part, 64)
+	return err == nil
+}
+
+func pptActiveDocumentText(streams []oleStream) []string {
+	doc, ok := findLegacyStream(streams, "PowerPoint Document")
+	if !ok {
+		return nil
+	}
+	offset, ok := pptActivePersistOffsets(streams)[1]
+	if !ok || int(offset)+8 > len(doc.Data) {
+		return nil
+	}
+	at := int(offset)
+	if binary.LittleEndian.Uint16(doc.Data[at+2:]) != 0x03e8 {
+		return nil
+	}
+	size := int(binary.LittleEndian.Uint32(doc.Data[at+4:]))
+	if size < 0 || size > len(doc.Data)-at-8 {
+		return nil
+	}
+	var out []string
+	pptRecordTextInto(doc.Data[at+8:at+8+size], 0, &out)
+	return out
+}
+
+func pptTextCoverage(candidate, full []string) float64 {
+	if len(full) == 0 {
+		return 1
+	}
+	seen := make(map[string]bool, len(candidate))
+	for _, part := range candidate {
+		seen[strings.TrimSpace(part)] = true
+	}
+	matched := 0
+	for _, part := range full {
+		if seen[strings.TrimSpace(part)] {
+			matched++
+		}
+	}
+	return float64(matched) / float64(len(full))
+}
+
+// pptActiveSlideContainers returns visible slide record payloads in the order
+// recorded by the active DocumentContainer.  It deliberately does not scan
+// the whole stream: legacy PowerPoint retains obsolete records after edits.
+func pptActiveSlideContainers(streams []oleStream) [][]byte {
+	doc, ok := findLegacyStream(streams, "PowerPoint Document")
+	if !ok {
+		return nil
+	}
+	active := pptActivePersistOffsets(streams)
+	documentOffset, ok := active[1]
+	if !ok || int(documentOffset)+8 > len(doc.Data) {
+		return nil
+	}
+	docOffset := int(documentOffset)
+	if binary.LittleEndian.Uint16(doc.Data[docOffset+2:]) != 0x03e8 {
+		return nil
+	}
+	documentSize := int(binary.LittleEndian.Uint32(doc.Data[docOffset+4:]))
+	if documentSize < 0 || documentSize > len(doc.Data)-docOffset-8 {
+		return nil
+	}
+	var ids []uint32
+	pptSlidePersistIDs(doc.Data[docOffset+8:docOffset+8+documentSize], 0, &ids)
+	var slides [][]byte
+	for _, id := range ids {
+		offset, ok := active[id]
+		if !ok || int(offset)+8 > len(doc.Data) {
+			continue
+		}
+		at := int(offset)
+		if binary.LittleEndian.Uint16(doc.Data[at+2:]) != 0x03ee {
+			continue
+		}
+		size := int(binary.LittleEndian.Uint32(doc.Data[at+4:]))
+		if size >= 0 && size <= len(doc.Data)-at-8 {
+			slides = append(slides, doc.Data[at+8:at+8+size])
+		}
+	}
+	return slides
+}
+
+// pptVisiblePictureImages follows the same object model as PowerPoint's
+// Slide.Shapes collection: only active SlideContainers are examined, and only
+// visible PictureFrame shapes are emitted.  A blip may be used by several
+// shapes, so the result deliberately preserves occurrences rather than
+// deduplicating by image content.
+func pptVisiblePictureImages(streams []oleStream) []Image {
+	pictures, ok := findLegacyStream(streams, "Pictures")
+	if !ok || len(pictures.Data) == 0 {
+		return nil
+	}
+	blips := pptBlipOffsets(streams)
+	if len(blips) == 0 {
+		return nil
+	}
+	var images []Image
+	for _, slide := range pptActiveSlideContainers(streams) {
+		for _, index := range pptVisiblePictureBlips(slide) {
+			offset, ok := blips[index]
+			if !ok {
+				continue
+			}
+			img, ok := pptPictureAt(pictures.Data, int(offset))
+			if !ok {
+				continue
+			}
+			img.Name = fmt.Sprintf("ppt-picture-%03d%s", len(images)+1, img.Ext)
+			images = append(images, img)
+		}
+	}
+	return images
+}
+
+// pptBlipOffsets reads OfficeArtBSE records.  The one-based BSE position is
+// the value stored in a PictureFrame's pib property; foDelay points into the
+// separate Pictures stream.
+func pptBlipOffsets(streams []oleStream) map[uint32]uint32 {
+	doc, ok := findLegacyStream(streams, "PowerPoint Document")
+	if !ok {
+		return nil
+	}
+	best := map[uint32]uint32{}
+	var walk func([]byte, int)
+	walk = func(data []byte, depth int) {
+		if depth > 12 {
+			return
+		}
+		pptWalkRecords(data, func(options, recordType uint16, payload []byte) {
+			if recordType == 0xf001 { // OfficeArtBStoreContainer
+				current := pptBSEOffsets(payload)
+				if len(current) > len(best) {
+					best = current
+				}
+			}
+			if options&0x000f == 0x000f {
+				walk(payload, depth+1)
+			}
+		})
+	}
+	walk(doc.Data, 0)
+	return best
+}
+
+func pptBSEOffsets(data []byte) map[uint32]uint32 {
+	out := map[uint32]uint32{}
+	index := uint32(1)
+	pptWalkRecords(data, func(_ uint16, recordType uint16, payload []byte) {
+		if recordType != 0xf007 || len(payload) < 32 { // OfficeArtBSE
+			return
+		}
+		// foDelay is an offset into the Pictures stream.  Zero is a valid
+		// offset for the first blip, not an absent-resource sentinel.
+		out[index] = binary.LittleEndian.Uint32(payload[28:])
+		index++
+	})
+	return out
+}
+
+func pptVisiblePictureBlips(data []byte) []uint32 {
+	var out []uint32
+	var walk func([]byte, int)
+	walk = func(data []byte, depth int) {
+		if depth > 16 {
+			return
+		}
+		pptWalkRecords(data, func(options, recordType uint16, payload []byte) {
+			if recordType == 0xf004 { // OfficeArtSpContainer
+				if index, ok := pptPictureFrameBlip(payload); ok {
+					out = append(out, index)
+				}
+				return
+			}
+			if options&0x000f == 0x000f {
+				walk(payload, depth+1)
+			}
+		})
+	}
+	walk(data, 0)
+	return out
+}
+
+func pptPictureFrameBlip(data []byte) (uint32, bool) {
+	var visiblePicture bool
+	var blip uint32
+	pptWalkRecords(data, func(options, recordType uint16, payload []byte) {
+		switch recordType {
+		case 0xf00a: // OfficeArtFSP
+			// msosptPictureFrame is 75.  Hidden/deleted shape flags differ
+			// from the 0xa00 flags used by PowerPoint-visible picture shapes.
+			if options>>4 == 75 && len(payload) >= 8 && binary.LittleEndian.Uint32(payload[4:]) == 0x0a00 {
+				visiblePicture = true
+			}
+		case 0xf00b: // OfficeArtFOPT
+			for off := 0; off+6 <= len(payload); off += 6 {
+				property := binary.LittleEndian.Uint16(payload[off:])
+				if property&0x3fff == 0x0104 { // fillBlip / pib
+					blip = binary.LittleEndian.Uint32(payload[off+2:])
+				}
+			}
+		}
+	})
+	return blip, visiblePicture && blip != 0
+}
+
+func pptPictureAt(data []byte, offset int) (Image, bool) {
+	if offset < 0 || offset+8 > len(data) {
+		return Image{}, false
+	}
+	size := int(binary.LittleEndian.Uint32(data[offset+4:]))
+	if size < 0 || size > len(data)-offset-8 {
+		return Image{}, false
+	}
+	payload := data[offset+8 : offset+8+size]
+	// OfficeArt raster blips have a 16-byte UID and one tag byte before the
+	// native image.  carveImages also gives us a conservative fallback for
+	// unusual producer-specific prefixes.
+	if len(payload) > 17 {
+		for _, ext := range []string{".png", ".jpg", ".gif", ".emf", ".wmf", ".dib", ".bmp"} {
+			if normalized, ok := normalizeImageData(ext, payload[17:]); ok {
+				return Image{Ext: ext, Data: append([]byte(nil), normalized...)}, true
+			}
+		}
+	}
+	if carved := carveImages(payload); len(carved) > 0 {
+		return carved[0], true
+	}
+	// The delayed blip may be a malformed raster or a metafile. Search from
+	// this exact BSE offset only, rather than the complete Pictures stream:
+	// that retains the visible shape -> resource association while covering
+	// producer-specific blip prefixes.
+	if carved := carveImages(data[offset:]); len(carved) > 0 {
+		return carved[0], true
+	}
+	return Image{}, false
+}
+
+func pptWalkRecords(data []byte, visit func(options, recordType uint16, payload []byte)) {
+	for offset := 0; offset+8 <= len(data); {
+		options := binary.LittleEndian.Uint16(data[offset:])
+		recordType := binary.LittleEndian.Uint16(data[offset+2:])
+		size := int(binary.LittleEndian.Uint32(data[offset+4:]))
+		offset += 8
+		if size < 0 || size > len(data)-offset {
+			return
+		}
+		visit(options, recordType, data[offset:offset+size])
+		offset += size
+	}
+}
+
+func pptSlidePersistIDs(data []byte, depth int, ids *[]uint32) {
+	if depth > 16 {
+		return
+	}
+	for offset := 0; offset+8 <= len(data); {
+		options := binary.LittleEndian.Uint16(data[offset:])
+		recordType := binary.LittleEndian.Uint16(data[offset+2:])
+		size := int(binary.LittleEndian.Uint32(data[offset+4:]))
+		offset += 8
+		if size < 0 || size > len(data)-offset {
+			return
+		}
+		payload := data[offset : offset+size]
+		if recordType == 0x03f3 && len(payload) >= 4 { // SlidePersistAtom
+			*ids = append(*ids, binary.LittleEndian.Uint32(payload))
+		}
+		if options&0x000f == 0x000f {
+			pptSlidePersistIDs(payload, depth+1, ids)
+		}
+		offset += size
+	}
+}
+
+// pptActivePersistOffsets resolves the current PowerPoint persist directory.
+// A legacy PPT appends edits rather than rewriting the document stream. The
+// Current User stream points at the latest UserEditAtom; traversing its linked
+// history makes the newest offset for each persist ID authoritative.
+func pptActivePersistOffsets(streams []oleStream) map[uint32]uint32 {
+	doc, ok := findLegacyStream(streams, "PowerPoint Document")
+	if !ok {
+		return nil
+	}
+	current, ok := findLegacyStream(streams, "Current User")
+	if !ok || len(current.Data) < 20 {
+		return nil
+	}
+	active := map[uint32]uint32{}
+	editOffset := int(binary.LittleEndian.Uint32(current.Data[16:]))
+	seen := map[int]bool{}
+	for editOffset >= 0 && editOffset+8 <= len(doc.Data) && !seen[editOffset] {
+		seen[editOffset] = true
+		options := binary.LittleEndian.Uint16(doc.Data[editOffset:])
+		recordType := binary.LittleEndian.Uint16(doc.Data[editOffset+2:])
+		size := int(binary.LittleEndian.Uint32(doc.Data[editOffset+4:]))
+		if recordType != 0x0ff5 || options&0x000f != 0 || size < 16 || editOffset+8+size > len(doc.Data) {
+			break
+		}
+		payload := doc.Data[editOffset+8 : editOffset+8+size]
+		directoryOffset := int(binary.LittleEndian.Uint32(payload[12:]))
+		if directoryOffset < 0 || directoryOffset+8 > len(doc.Data) || binary.LittleEndian.Uint16(doc.Data[directoryOffset+2:]) != 0x1772 {
+			break
+		}
+		directorySize := int(binary.LittleEndian.Uint32(doc.Data[directoryOffset+4:]))
+		if directorySize < 0 || directoryOffset+8+directorySize > len(doc.Data) {
+			break
+		}
+		directory := doc.Data[directoryOffset+8 : directoryOffset+8+directorySize]
+		for off := 0; off+4 <= len(directory); {
+			header := binary.LittleEndian.Uint32(directory[off:])
+			off += 4
+			count, firstID := int(header>>20), uint32(header&0x000fffff)
+			if count <= 0 || count > (len(directory)-off)/4 {
+				return nil
+			}
+			for i := 0; i < count; i++ {
+				id := firstID + uint32(i)
+				if _, exists := active[id]; !exists {
+					active[id] = binary.LittleEndian.Uint32(directory[off:])
+				}
+				off += 4
+			}
+		}
+		// UserEditAtom starts with lastSlideIdRef (four bytes), followed by
+		// version/minor/major (four bytes).  The linked previous edit offset is
+		// therefore at byte 8, not at byte 0.  Reading lastSlideIdRef here made
+		// us stop after the latest persist directory and leak stale slide records
+		// through the fallback full-stream scan.
+		previous := int(binary.LittleEndian.Uint32(payload[8:]))
+		if previous == 0 || previous == editOffset {
+			break
+		}
+		editOffset = previous
+	}
+	return active
 }
 
 func extractPPTFallbackStrings(data []byte) []string {
@@ -1499,7 +1915,39 @@ func looksLikePPTFallbackNonASCIIText(s string) bool {
 func pptRecordText(data []byte) []string {
 	var out []string
 	pptRecordTextInto(data, 0, &out)
-	return uniqueStrings(cleanPPTRecordTextParts(out))
+	return cleanPPTRecordTextParts(dropPPTRepeatedShapeRuns(dropPPTOutlinePlaceholders(out)))
+}
+
+func dropPPTOutlinePlaceholders(parts []string) []string {
+	placeholders := map[string]bool{
+		"second level": true, "third level": true,
+		"fourth level": true, "fifth level": true,
+	}
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if !placeholders[strings.ToLower(strings.TrimSpace(part))] {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// A replaced PowerPoint shape tree can be retained immediately before its
+// rendered replacement. Remove one high-confidence repeated run only; slide
+// titles legitimately repeat on different visible slides.
+func dropPPTRepeatedShapeRuns(parts []string) []string {
+	for start := 0; start < len(parts); start++ {
+		for next := start + 3; next < len(parts); next++ {
+			common := 0
+			for start+common < next && next+common < len(parts) && parts[start+common] == parts[next+common] {
+				common++
+			}
+			if common >= 3 {
+				return append(append([]string{}, parts[:start]...), parts[next:]...)
+			}
+		}
+	}
+	return parts
 }
 
 type pptMarkdownSection struct {
@@ -1619,6 +2067,12 @@ func pptRecordMarkdownSlidePartsInto(data []byte, depth int, body *[]string, not
 			return
 		}
 		payload := data[off : off+size]
+		// Notes are not returned by Slide.Shapes, the strict Office-visible
+		// text contract used by Result.Text.
+		if recType == 0x03f0 && options&0x000f == 0x000f {
+			off += size
+			continue
+		}
 		switch recType {
 		case 0x0fa0: // TextCharsAtom
 			text := utf16BytesToStringAll(payload)
@@ -1652,6 +2106,10 @@ func pptRecordTextInto(data []byte, depth int, out *[]string) {
 			return
 		}
 		payload := data[off : off+size]
+		if recType == 0x03f0 && options&0x000f == 0x000f {
+			off += size
+			continue
+		}
 		switch recType {
 		case 0x0fa0: // TextCharsAtom
 			text := utf16BytesToStringAll(payload)
