@@ -18,11 +18,94 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf16"
 	"unicode/utf8"
 )
+
+func TestOOXMLTextBoundaryKeepsFormattedOrdinalSuffixTogether(t *testing.T) {
+	for _, test := range []struct {
+		left, right, want string
+	}{
+		{"21", "st", "21st"},
+		{"18", "th", "18th"},
+		{"r", "elease", "release"},
+		{"H", "igh", "High"},
+		{"O", "ccupancy", "Occupancy"},
+		{"New a", "lgorithms", "New algorithms"},
+		{"a", "vertex", "a vertex"},
+		{"M", "emory", "Memory"},
+		{"Ho", "w", "How"},
+		{"Ho", "w hard", "How hard"},
+		{"RM", "M", "RMM"},
+		{"W", "ORLD", "W ORLD"},
+		{"R", "MM (A, B, n)", "RMM (A, B, n)"},
+	} {
+		var out []string
+		appendOOXMLVisibleTextSegment(&out, test.left)
+		appendOOXMLVisibleTextSegment(&out, test.right)
+		if got := strings.Join(out, ""); got != test.want {
+			t.Fatalf("formatted run %q + %q = %q, want %q", test.left, test.right, got, test.want)
+		}
+	}
+}
+
+func TestPPTXPictureRelationshipOccurrencesKeepDuplicatePictureShapes(t *testing.T) {
+	b := []byte(`<p:spTree xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:pic><p:blipFill><a:blip r:embed="rId7"/></p:blipFill></p:pic><p:pic><p:blipFill><a:blip r:embed="rId7"/></p:blipFill></p:pic></p:spTree>`)
+	got, err := pptxPictureRelationshipIDOccurrences(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"rId7", "rId7"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("picture relationship occurrences = %#v, want %#v", got, want)
+	}
+}
+
+func TestPPTXPictureRelationshipOccurrencesKeepGroupPictureAndExcludeOLEPreview(t *testing.T) {
+	b := []byte(`<p:spTree xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:grpSp><p:pic><p:blipFill><a:blip r:embed="rIdGroup"/></p:blipFill></p:pic></p:grpSp><p:oleObj><p:pic><p:blipFill><a:blip r:embed="rIdPreview"/></p:blipFill></p:pic></p:oleObj></p:spTree>`)
+	got, err := pptxPictureRelationshipIDOccurrences(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"rIdGroup"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("picture relationship occurrences = %#v, want %#v", got, want)
+	}
+}
+
+func TestVisiblePptxShapeTextKeepsGroupMemberText(t *testing.T) {
+	b := []byte(`<p:spTree xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:grpSp><p:sp><p:txBody><a:p><a:r><a:t>Grouped text</a:t></a:r></a:p></p:txBody></p:sp></p:grpSp></p:spTree>`)
+	got, err := visiblePptxShapeText(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "Grouped text" {
+		t.Fatalf("visible shape text = %q, want %q", got, "Grouped text")
+	}
+}
+
+func TestVisiblePptxShapeTextKeepsBaselineOffsetMathRunsTogether(t *testing.T) {
+	b := []byte(`<p:spTree xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:sp><p:txBody><a:p><a:r><a:rPr/><a:t>A</a:t></a:r><a:r><a:rPr baseline="30000"/><a:t>2</a:t></a:r><a:r><a:rPr/><a:t>x</a:t></a:r><a:r><a:rPr/><a:t> matrix</a:t></a:r></a:p></p:txBody></p:sp></p:spTree>`)
+	got, err := visiblePptxShapeText(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "A2x matrix" {
+		t.Fatalf("visible shape text = %q, want %q", got, "A2x matrix")
+	}
+}
+
+func TestVisiblePptxShapeTextKeepsExplicitLineBreak(t *testing.T) {
+	b := []byte(`<p:spTree xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:sp><p:txBody><a:p><a:r><a:t>Above</a:t></a:r><a:br/><a:r><a:t>Below</a:t></a:r></a:p></p:txBody></p:sp></p:spTree>`)
+	got, err := visiblePptxShapeText(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "Above\nBelow" {
+		t.Fatalf("visible shape text = %q, want explicit break", got)
+	}
+}
 
 func TestExtractDownloadedSamples(t *testing.T) {
 	samples, err := filepath.Glob(filepath.Join("testdata", "samples", "*.*"))
@@ -1235,6 +1318,30 @@ func TestOOXMLVisibleSymbolsAreExtractedAsText(t *testing.T) {
 	}
 	if strings.Contains(res.Text, "Hidden") || strings.Contains(res.Text, "\uf0fc") || strings.Contains(res.Text, "\uf123") {
 		t.Fatalf("kept hidden or private-use symbol text in %q", res.Text)
+	}
+}
+
+func TestStrictDOCXSuppressesTextRenderedBySymbolFont(t *testing.T) {
+	if !isFontEncodedSymbolFont("Webdings") {
+		t.Fatal("Webdings must be recognized as a symbol font")
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	addZip(t, zw, "[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`)
+	addZip(t, zw, "word/document.xml", `<w:document xmlns:w="urn:w"><w:body><w:p><w:r><w:rPr><w:rFonts w:ascii="Webdings" w:hAnsi="Webdings"/></w:rPr><w:t>add text</w:t></w:r><w:r><w:t>Visible tail</w:t></w:r></w:p></w:body></w:document>`)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "symbol-font.docx")
+	if err := os.WriteFile(file, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Extract(file, Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Text, "add text") || !strings.Contains(res.Text, "Visible tail") {
+		t.Fatalf("strict symbol-font text = %q", res.Text)
 	}
 }
 
@@ -3027,6 +3134,16 @@ func TestWMFImagesAreValidatedTrimmedAndCarved(t *testing.T) {
 	carved := carveImages(append(append([]byte("prefix"), wmf...), []byte("suffix")...))
 	if len(carved) != 1 || carved[0].Ext != ".wmf" || !bytes.Equal(carved[0].Data, wmf) {
 		t.Fatalf("expected one carved WMF, got %#v", carved)
+	}
+}
+
+func TestWMFAllowsOfficeTerminatingPadWord(t *testing.T) {
+	wmf := append(testPlaceableWMF(), 0, 0)
+	// Office counts the optional pad word in the standard WMF header's mtSize.
+	binary.LittleEndian.PutUint32(wmf[22+6:], uint32(len(wmf)-22)/2)
+	normalized, ok := normalizeImageData(".wmf", wmf)
+	if !ok || !bytes.Equal(normalized, wmf) {
+		t.Fatalf("expected Office-padded WMF to remain valid, got ok=%v data=%#v", ok, normalized)
 	}
 }
 
@@ -14794,6 +14911,38 @@ func TestXLSXDefinedNameFormulaValuesAreNotVisibleText(t *testing.T) {
 	}
 }
 
+func TestStrictXLSXDoesNotRepeatWorkbookDefinedNamesAsCells(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	addZip(t, zw, "[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`)
+	addZip(t, zw, "xl/workbook.xml", `<workbook xmlns="urn:x" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" r:id="rId1"/></sheets><definedNames><definedName name="dt">Sheet1!$A$1</definedName><definedName name="sigma">Sheet1!$B$1</definedName></definedNames></workbook>`)
+	addZip(t, zw, "xl/_rels/workbook.xml.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="x" Target="worksheets/sheet1.xml"/></Relationships>`)
+	addZip(t, zw, "xl/worksheets/sheet1.xml", `<worksheet xmlns="urn:x"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>dt</t></is></c><c r="B1" t="inlineStr"><is><t>sigma</t></is></c></row></sheetData></worksheet>`)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "strict-defined-names.xlsx")
+	if err := os.WriteFile(file, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	strict, err := Extract(file, Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"dt", "sigma"} {
+		if count := len(strings.Fields(strict.Text)) - len(strings.Fields(strings.ReplaceAll(strict.Text, value, ""))); count != 1 {
+			t.Fatalf("strict text should contain cell value %q exactly once, got %d in %q", value, count, strict.Text)
+		}
+	}
+	nonstrict, err := Extract(file, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(nonstrict.Markdown("images"), "## Workbook Names") {
+		t.Fatalf("compatibility Markdown should retain named-range metadata:\n%s", nonstrict.Markdown("images"))
+	}
+}
+
 func TestXLSXHeaderFooterControlCodesAreNotVisibleText(t *testing.T) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
@@ -14833,6 +14982,21 @@ func TestXLSXHeaderFooterControlCodesAreNotVisibleText(t *testing.T) {
 		if strings.Contains(md, bad) {
 			t.Fatalf("markdown kept header/footer control code %q in:\n%s", bad, md)
 		}
+	}
+	strict, err := Extract(file, Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strict.Text, "Visible Cell") {
+		t.Fatalf("strict Office content omitted worksheet cell text: %q", strict.Text)
+	}
+	for _, headerFooter := range []string{"Left Header", "Red Footer", "Outline Text", "Shadow Text"} {
+		if strings.Contains(strict.Text, headerFooter) {
+			t.Fatalf("strict Office content retained print header/footer %q in %q", headerFooter, strict.Text)
+		}
+	}
+	if strings.Contains(strict.Markdown("images"), "### Headers and Footers") {
+		t.Fatalf("strict Office markdown retained print header/footer: %s", strict.Markdown("images"))
 	}
 }
 
@@ -15795,6 +15959,31 @@ func TestStrictPPTXImagesExcludeOLEPreviewAndLayoutMedia(t *testing.T) {
 	}
 }
 
+func TestStrictPPTXImagesExcludeOrphanedMediaWhenSlidesHaveNoPictureShapes(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	addZip(t, zw, "[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`)
+	addZip(t, zw, "ppt/presentation.xml", `<p:presentation xmlns:p="urn:p" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId r:id="rId1"/></p:sldIdLst></p:presentation>`)
+	addZip(t, zw, "ppt/_rels/presentation.xml.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>`)
+	addZip(t, zw, "ppt/slides/slide1.xml", `<p:sld xmlns:p="urn:p"><p:cSld><p:spTree><p:sp/></p:spTree></p:cSld></p:sld>`)
+	addZipBytes(t, zw, "ppt/media/orphaned.png", testPNG())
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "strict-no-pictures.pptx")
+	if err := os.WriteFile(file, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Extract(file, Options{StrictOfficeImages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Images) != 0 {
+		t.Fatalf("strict Extract images = %#v, want no Picture Shapes", res.Images)
+	}
+}
+
 func TestStrictPPTXWebSampleMatchesPowerPointPictureCount(t *testing.T) {
 	file := filepath.Join("testdata", "web-samples", "samples", "pptx", "00020011.pptx")
 	res, err := Extract(file, Options{StrictOfficeImages: true})
@@ -15806,6 +15995,143 @@ func TestStrictPPTXWebSampleMatchesPowerPointPictureCount(t *testing.T) {
 	// which are intentionally excluded by StrictOfficeImages.
 	if len(res.Images) != 4 {
 		t.Fatalf("strict PPTX image count = %d, want 4 (PowerPoint Picture Shapes)", len(res.Images))
+	}
+}
+
+func TestStrictPPTXExcludesGroupedAndMediaPlayerPictureCaches(t *testing.T) {
+	file := filepath.Join("testdata", "web-samples", "samples", "pptx", "00022654.pptx")
+	zr, err := zip.OpenReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	files := make(map[string]*zip.File, len(zr.File))
+	for _, f := range zr.File {
+		files[f.Name] = f
+	}
+	if media, ok := strictPptxVisibleMediaParts(files); !ok || len(media) != 23 {
+		t.Fatalf("strict PPTX media count = %d, ok=%v; want 23", len(media), ok)
+	}
+	result, err := Extract(file, Options{StrictOfficeImages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PowerPoint COM exposes 23 top-level msoPicture shapes. This deck also
+	// contains ten grouped Picture Shapes and nine Windows Media Player poster
+	// caches; neither belongs to Slide.Shapes as a Picture.
+	if len(result.Images) != 23 {
+		t.Fatalf("strict PPTX image count = %d, want 23 PowerPoint Picture Shapes", len(result.Images))
+	}
+}
+
+func TestStrictPPTXExcludesVideoPosterFrameCaches(t *testing.T) {
+	file := filepath.Join("testdata", "web-samples", "samples", "pptx", "00022291.pptx")
+	result, err := Extract(file, Options{StrictOfficeImages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PowerPoint COM exposes 88 msoPicture shapes. The remaining top-level
+	// p:pic in this package is the poster frame for an embedded AVI control.
+	if len(result.Images) != 88 {
+		t.Fatalf("strict PPTX image count = %d, want 88 PowerPoint Picture Shapes", len(result.Images))
+	}
+}
+
+func TestStrictPPTXPreservesRepeatedVisiblePictureOccurrences(t *testing.T) {
+	file := filepath.Join("testdata", "web-samples", "samples", "pptx", "00022181.pptx")
+	result, err := Extract(file, Options{StrictOfficeImages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Images) != 15 {
+		t.Fatalf("strict visible picture occurrences = %d, want 15", len(result.Images))
+	}
+}
+
+func TestStrictPPTXTextExcludesGroupedShapesAndPictureAltText(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	addZip(t, zw, "[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`)
+	addZip(t, zw, "ppt/presentation.xml", `<p:presentation xmlns:p="urn:p" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId r:id="rId1"/></p:sldIdLst></p:presentation>`)
+	addZip(t, zw, "ppt/_rels/presentation.xml.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="slide" Target="slides/slide1.xml"/></Relationships>`)
+	addZip(t, zw, "ppt/slides/slide1.xml", `<p:sld xmlns:p="urn:p" xmlns:a="urn:a"><p:cSld><p:spTree>
+<p:sp><p:txBody><a:p><a:r><a:t>Top Level Text</a:t></a:r></a:p></p:txBody></p:sp>
+<p:pic><p:nvPicPr><p:cNvPr descr="Picture Alt Text"/></p:nvPicPr></p:pic>
+<p:grpSp><p:sp><p:txBody><a:p><a:r><a:t>Grouped Text</a:t></a:r></a:p></p:txBody></p:sp></p:grpSp>
+</p:spTree></p:cSld></p:sld>`)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "strict-shape-text.pptx")
+	if err := os.WriteFile(file, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Extract(file, Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != "Top Level Text" {
+		t.Fatalf("strict PowerPoint text = %q, want top-level shape text only", res.Text)
+	}
+}
+
+func TestStrictDOCXTextExcludesFloatingVMLTextBoxes(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	addZip(t, zw, "[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`)
+	addZip(t, zw, "word/document.xml", `<w:document xmlns:w="urn:w" xmlns:v="urn:v"><w:body>
+<w:p><w:r><w:t>Document Content</w:t></w:r></w:p>
+<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>Floating Text Box</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>
+</w:body></w:document>`)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "strict-floating-text.docx")
+	if err := os.WriteFile(file, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Extract(file, Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != "Document Content" {
+		t.Fatalf("strict Word text = %q, want document story only", res.Text)
+	}
+	normal, err := Extract(file, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(normal.Text, "Floating Text Box") {
+		t.Fatalf("normal extraction omitted floating VML text box: %q", normal.Text)
+	}
+}
+
+func TestStrictPPTXTextExcludesTableCellText(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	addZip(t, zw, "[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`)
+	addZip(t, zw, "ppt/presentation.xml", `<p:presentation xmlns:p="urn:p" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId r:id="rId1"/></p:sldIdLst></p:presentation>`)
+	addZip(t, zw, "ppt/_rels/presentation.xml.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="slide" Target="slides/slide1.xml"/></Relationships>`)
+	addZip(t, zw, "ppt/slides/slide1.xml", `<p:sld xmlns:p="urn:p" xmlns:a="urn:a"><p:cSld><p:spTree>
+<p:sp><p:txBody><a:p><a:r><a:t>Top Level Text</a:t></a:r></a:p></p:txBody></p:sp>
+<p:graphicFrame><a:graphic><a:graphicData><a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>Table Cell Text</a:t></a:r></a:p></a:txBody></a:tc></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>
+</p:spTree></p:cSld></p:sld>`)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "strict-table-text.pptx")
+	if err := os.WriteFile(file, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Extract(file, Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != "Top Level Text" {
+		t.Fatalf("strict PowerPoint text = %q, want top-level shape text only", res.Text)
 	}
 }
 

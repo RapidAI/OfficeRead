@@ -3883,9 +3883,6 @@ func standardWMFDeclaredSize(b []byte) (int, bool) {
 	if maxRecordWords < 3 || maxRecordWords > sizeWords {
 		return 0, false
 	}
-	if binary.LittleEndian.Uint32(b[size-6:]) != 3 || binary.LittleEndian.Uint16(b[size-2:]) != 0 {
-		return 0, false
-	}
 	if !validStandardWMFRecords(b[:size], maxRecordWords) {
 		return 0, false
 	}
@@ -3905,7 +3902,16 @@ func validStandardWMFRecords(b []byte, maxRecordWords uint32) bool {
 		}
 		end := off + int(recordBytes)
 		if function == 0 {
-			return recordWords == 3 && end == len(b)
+			if recordWords != 3 {
+				return false
+			}
+			if end == len(b) {
+				return true
+			}
+			// Some Office-generated placeable WMFs include one terminating zero
+			// word after META_EOF and include it in mtSize.  It is structural
+			// padding, not trailing payload, and Office still exposes the shape.
+			return end+2 == len(b) && b[end] == 0 && b[end+1] == 0
 		}
 		off = end
 	}

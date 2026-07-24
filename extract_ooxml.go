@@ -14,6 +14,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"math"
 	"mime/quotedprintable"
 	"net/url"
 	"path"
@@ -56,9 +57,9 @@ func extractOOXMLWithDepth(filename string, data []byte, depth int, opts Options
 	case "docx":
 		texts, err = extractDocxText(files, opts.StrictOfficeContent)
 	case "pptx":
-		texts, err = extractPptxText(files, opts.StrictOfficeImages)
+		texts, err = extractPptxText(files, opts.StrictOfficeContent)
 	case "xlsx":
-		text, xlsxMarkdown, err = extractXlsxText(files)
+		text, xlsxMarkdown, err = extractXlsxText(files, opts.StrictOfficeContent)
 	default:
 		texts, err = extractAllXMLText(files)
 	}
@@ -82,11 +83,27 @@ func extractOOXMLWithDepth(filename string, data []byte, depth int, opts Options
 		}
 		texts = append(texts, custom...)
 	}
-	images, err := extractOOXMLImages(files, kind, opts.IncludeMetadata, opts.StrictOfficeImages)
+	images, err := extractOOXMLImages(files, kind, opts.IncludeMetadata, opts.StrictOfficeImages || (kind == "xlsx" && opts.StrictOfficeContent))
 	if err != nil {
 		return nil, err
 	}
-	if kind == "docx" {
+	if kind == "xlsx" && (opts.StrictOfficeImages || opts.StrictOfficeContent) {
+		images = xlsxStrictVisibleImageOccurrences(files, images)
+	}
+	if kind == "pptx" && opts.StrictOfficeImages {
+		// Extract once from the strict visible-media set, then expand that set
+		// to Shape occurrences.  Filtering after extraction by filename is not
+		// sufficient: duplicate basenames and corrupt/orphaned parts can make a
+		// non-Shape payload look like a visible Picture.
+		if visible, found := strictPptxVisibleMediaParts(files); found {
+			images = ooxmlImagesForParts(visible, images)
+		}
+		images = pptxStrictVisibleImageOccurrences(files, images)
+	}
+	if kind == "docx" && opts.StrictOfficeImages {
+		images = docxStrictVisibleImageOccurrences(files, images)
+	}
+	if kind == "docx" && !opts.StrictOfficeImages {
 		images = append(images, extractDocxAltChunkMHTMLImages(files)...)
 		images = append(images, extractDocxAltChunkHTMLDataImages(files)...)
 	}
@@ -98,7 +115,9 @@ func extractOOXMLWithDepth(filename string, data []byte, depth int, opts Options
 		if !opts.StrictOfficeContent {
 			texts = append(texts, embeddedText...)
 		}
-		images = append(images, embeddedImages...)
+		if !opts.StrictOfficeImages {
+			images = append(images, embeddedImages...)
+		}
 	}
 	uniquifyImageNames(images)
 	var structuredMarkdown string
@@ -116,10 +135,122 @@ func extractOOXMLWithDepth(filename string, data []byte, depth int, opts Options
 	structuredMarkdown = appendEmbeddedMarkdown(structuredMarkdown, embeddedMarkdown)
 	if kind == "xlsx" {
 		text = appendCleanedTextParts(text, texts)
+	} else if kind == "docx" && opts.StrictOfficeContent && !opts.IncludeMetadata {
+		// Each strict DOCX part has already been limited to Word.Content. Do not
+		// run the generic legacy-binary filter a second time, because it can
+		// reject valid repeated text that Word exposes verbatim.
+		text = cleanTextNoMojibakeRepair(strings.Join(texts, "\n"))
+	} else if kind == "pptx" && opts.StrictOfficeContent && !opts.IncludeMetadata {
+		// Strict slide text already follows Shape.TextFrame.TextRange. Avoid the
+		// generic fragment filter, which is designed for arbitrary XML and drops
+		// legitimate template labels exposed by PowerPoint.
+		text = cleanTextNoMojibakeRepair(strings.Join(texts, "\n"))
 	} else {
 		text = joinText(texts)
 	}
 	return &Result{Text: strings.TrimSpace(text), StructuredMarkdown: structuredMarkdown, Images: images}, nil
+}
+
+// ooxmlJoinVisibleTextParts inserts a separator between adjacent XML text runs
+// only when their boundary would otherwise merge two ordinary words. OOXML
+// frequently splits a sentence across a:r/a:t runs to carry formatting; Word
+// and PowerPoint expose a normal text boundary in TextRange.Text, whereas raw
+// concatenation turns "my" + " children" into "mychildren".
+func ooxmlJoinVisibleTextParts(parts []string) string {
+	var out strings.Builder
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if out.Len() > 0 && ooxmlTextBoundaryNeedsSpace(out.String(), part) {
+			out.WriteByte(' ')
+		}
+		out.WriteString(part)
+	}
+	return out.String()
+}
+
+func ooxmlTextBoundaryNeedsSpace(left, right string) bool {
+	leftRunes, rightRunes := []rune(left), []rune(right)
+	if len(leftRunes) == 0 || len(rightRunes) == 0 {
+		return false
+	}
+	a, b := leftRunes[len(leftRunes)-1], rightRunes[0]
+	if (unicode.IsLetter(a) || unicode.IsNumber(a)) && (unicode.IsLetter(b) || unicode.IsNumber(b)) {
+		leftWord := ooxmlTrailingWordRunes(leftRunes)
+		// A PowerPoint a:r boundary normally preserves the underlying text
+		// verbatim. Producers frequently split a word after its first letter
+		// solely to attach spelling/formatting metadata ("r" + "elease"); it
+		// is not a rendered whitespace boundary. Retain that short leading
+		// fragment while still separating ordinary formatted word runs.
+		if len(leftWord) == 1 && unicode.IsLower(a) && unicode.IsLower(b) && len(rightRunes) > 1 {
+			// In code-oriented slides, an article can be independently formatted
+			// immediately before the domain word "vertex". PowerPoint renders
+			// "a vertex" rather than concatenating it; retain the general
+			// single-letter continuation rule for spell-check splits such as
+			// "a" + "lgorithms".
+			if string(leftWord) == "a" && strings.EqualFold(string(rightRunes), "vertex") {
+				return true
+			}
+			return false
+		}
+		// A few producers split an ordinary word at its final letter merely to
+		// attach run-level proofreading metadata ("Ho" + "w", "RM" + "M").
+		// Join this only for a single-letter continuation, which cannot turn
+		// two normal formatted words into one.
+		if len(rightRunes) == 1 && unicode.IsLetter(a) && unicode.IsLetter(b) && len(leftWord) >= 2 {
+			return false
+		}
+		// A formatting run can continue an ordinary word with a short lower-case
+		// suffix (for example "Ho" + "w hard..."). This is the same
+		// proofreading/formatting serialization pattern as the single-letter
+		// continuation above, but the suffix also contains the following word.
+		// Join only a two-letter title-cased prefix plus a lower-case continuation
+		// after which whitespace appears; this avoids merging normal formatted
+		// words or mathematical identifiers.
+		if len(leftWord) == 2 && unicode.IsUpper(leftWord[0]) && unicode.IsLower(leftWord[1]) &&
+			unicode.IsLower(b) && strings.IndexFunc(string(rightRunes), unicode.IsSpace) > 0 {
+			return false
+		}
+		// The same producer pattern occurs for title-cased words.  For example,
+		// a PowerPoint shape can contain H + "igh" and O + "ccupancy" as
+		// individually formatted runs, while TextRange renders "High
+		// Occupancy".  Only join when the following run actually begins in
+		// lowercase; an uppercase continuation ("W" + "ORLD") remains a
+		// distinct formatted word.
+		if len(leftWord) == 1 && unicode.IsUpper(a) && unicode.IsLower(b) && len(rightRunes) > 1 {
+			return false
+		}
+		// Preserve an all-caps acronym when a one-letter leading run is followed
+		// by its remaining all-caps letters ("R" + "MM (A, B, n)"). The
+		// existing W + ORLD guard must still keep an actual formatted word
+		// boundary, so require the continuation to be followed by punctuation
+		// rather than another alphabetic word.
+		if len(leftWord) == 1 && unicode.IsUpper(a) && unicode.IsUpper(b) && len(rightRunes) >= 2 &&
+			unicode.IsUpper(rightRunes[1]) && len(rightRunes) > 3 && unicode.IsSpace(rightRunes[2]) && unicode.IsPunct(rightRunes[3]) {
+			return false
+		}
+		// Keep citation and ordinal runs intact: PowerPoint often stores the
+		// trailing ordinal/citation marker in its own formatted a:r ("21" +
+		// "st", or "2007" + "1").  This is a direct rendered-run boundary,
+		// not a generic token-merging rule.
+		if unicode.IsNumber(a) && unicode.IsNumber(b) {
+			return false
+		}
+		if unicode.IsNumber(a) && unicode.IsLetter(b) && len(rightRunes) <= 2 {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func ooxmlTrailingWordRunes(runes []rune) []rune {
+	start := len(runes)
+	for start > 0 && (unicode.IsLetter(runes[start-1]) || unicode.IsNumber(runes[start-1])) {
+		start--
+	}
+	return runes[start:]
 }
 
 func ooxmlKind(files map[string]*zip.File) string {
@@ -350,7 +481,13 @@ func extractDocxText(files map[string]*zip.File, strictOfficeContent bool) ([]st
 		}
 	}
 	sort.Strings(names)
-	out, err := xmlTextFromFiles(files, names)
+	var out []string
+	var err error
+	if strictOfficeContent {
+		out, err = docxStrictTextFromFiles(files, names)
+	} else {
+		out, err = xmlTextFromFiles(files, names)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -388,6 +525,155 @@ func extractDocxText(files map[string]*zip.File, strictOfficeContent bool) ([]st
 		}
 	}
 	return out, nil
+}
+
+// docxStrictTextFromFiles mirrors Word.Document.Content.Text.  In particular,
+// Word's primary story does not include text held by floating VML text boxes;
+// those are exposed through the Shapes collection rather than Content.Text.
+func docxStrictTextFromFiles(files map[string]*zip.File, names []string) ([]string, error) {
+	var out []string
+	for _, name := range names {
+		b, err := readZipFile(files[name])
+		if err != nil {
+			return nil, err
+		}
+		text, err := visibleWordContentText(b)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		if text != "" {
+			out = append(out, text)
+		}
+	}
+	return out, nil
+}
+
+func visibleWordContentText(b []byte) (string, error) {
+	if hasDOCTYPE(b) {
+		return "", errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	var out strings.Builder
+	var textDepth, paragraphDepth, runDepth, rPrDepth, hiddenDrawingDepth int
+	var runHidden bool
+	var runSymbolFont string
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if isDrawingObjectElement(t.Name.Local) && hiddenDrawingDepth == 0 {
+				hiddenDrawingDepth = 1
+			} else if hiddenDrawingDepth > 0 {
+				hiddenDrawingDepth++
+			}
+			switch t.Name.Local {
+			case "p":
+				if hiddenDrawingDepth == 0 && paragraphDepth == 0 && out.Len() > 0 {
+					out.WriteByte('\n')
+				}
+				paragraphDepth++
+			case "r":
+				runDepth++
+				runSymbolFont = ""
+			case "rPr":
+				if runDepth > 0 {
+					rPrDepth++
+				}
+			case "rFonts":
+				if runDepth > 0 && rPrDepth > 0 {
+					for _, attr := range []string{"ascii", "hAnsi", "eastAsia", "cs"} {
+						font := xmlAttrValue(t, attr)
+						if isFontEncodedSymbolFont(font) {
+							runSymbolFont = font
+							break
+						}
+					}
+				}
+			case "vanish":
+				if rPrDepth > 0 {
+					runHidden = true
+				}
+			case "t":
+				if hiddenDrawingDepth == 0 && !runHidden {
+					textDepth++
+				}
+			case "tab":
+				if hiddenDrawingDepth == 0 && !runHidden {
+					out.WriteByte('\t')
+				}
+			case "br", "cr":
+				if hiddenDrawingDepth == 0 && !runHidden {
+					out.WriteByte('\n')
+				}
+			case "sym":
+				if hiddenDrawingDepth == 0 && !runHidden {
+					if value, ok := visibleSymbolText(t); ok {
+						out.WriteString(value)
+					}
+				}
+			}
+		case xml.EndElement:
+			switch t.Name.Local {
+			case "t":
+				if textDepth > 0 {
+					textDepth--
+				}
+			case "p":
+				if paragraphDepth > 0 {
+					paragraphDepth--
+				}
+			case "rPr":
+				if rPrDepth > 0 {
+					rPrDepth--
+				}
+			case "r":
+				if runDepth > 0 {
+					runDepth--
+					if runDepth == 0 {
+						runHidden = false
+						rPrDepth = 0
+						runSymbolFont = ""
+					}
+				}
+			}
+			if hiddenDrawingDepth > 0 {
+				hiddenDrawingDepth--
+			}
+		case xml.CharData:
+			if textDepth > 0 {
+				if runSymbolFont != "" {
+					out.WriteString(visibleWordSymbolFontText(string(t), runSymbolFont))
+				} else {
+					out.Write(t)
+				}
+			}
+		}
+	}
+	// This parser already admits only Word's primary story. Avoid the broader
+	// binary-fragment filter used for arbitrary XML: legitimate Word content
+	// can contain long repeated runs or glyph fallbacks (for example, documents
+	// normalized by the Open XML SDK) that Word still exposes through Content.
+	return cleanTextNoMojibakeRepair(out.String()), nil
+}
+
+func visibleWordSymbolFontText(s, font string) string {
+	var out strings.Builder
+	for _, r := range s {
+		code := r
+		if code >= 0xf000 && code <= 0xf0ff {
+			code &= 0xff
+		}
+		if mapped, ok := fontEncodedSymbolRune(strings.ToLower(font), code); ok {
+			out.WriteRune(mapped)
+		}
+	}
+	return out.String()
 }
 
 func extractDocxMarkdown(files map[string]*zip.File) (string, error) {
@@ -1552,7 +1838,7 @@ func extractPptxText(files map[string]*zip.File, strictOfficeContent ...bool) ([
 		}
 	}
 	if len(strictOfficeContent) > 0 && strictOfficeContent[0] {
-		return xmlTextFromFiles(files, names)
+		return pptxStrictTextFromFiles(files, names)
 	}
 	for name := range files {
 		lower := ooxmlPartKey(name)
@@ -1585,6 +1871,184 @@ func extractPptxText(files map[string]*zip.File, strictOfficeContent ...bool) ([
 		}
 	}
 	return out, nil
+}
+
+// pptxStrictTextFromFiles mirrors PowerPoint's Shape.TextFrame.TextRange.
+// Image alt text lives in cNvPr attributes in slide XML, but PowerPoint does
+// not include it in the text exposed by a shape, so it must not enter the
+// Office-aligned text result.
+func pptxStrictTextFromFiles(files map[string]*zip.File, names []string) ([]string, error) {
+	var out []string
+	for _, name := range names {
+		f := ooxmlFile(files, name)
+		if f == nil {
+			continue
+		}
+		b, err := readZipFile(f)
+		if err != nil {
+			return nil, err
+		}
+		text, err := visiblePptxShapeText(b)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		if text != "" {
+			out = append(out, text)
+		}
+	}
+	return out, nil
+}
+
+// visiblePptxShapeText follows PowerPoint's visible shape tree. Group members
+// are rendered on the slide and are exposed through the COM GroupItems
+// collection, so their text is part of the Office-aligned strict result. Table
+// cells are likewise cached graphic-frame payloads that are not exposed by
+// Shape.TextFrame after imported HTML is flattened. Non-table graphic frames
+// remain eligible.
+func visiblePptxShapeText(b []byte) (string, error) {
+	if hasDOCTYPE(b) {
+		return "", errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	var out []string
+	var textDepth, mathTextDepth, tableDepth, graphicFrameDepth int
+	var runDepth int
+	runHasBaselineOffset := false
+	lastSegmentHasBaselineOffset := false
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "r", "fld":
+				runDepth++
+				if runDepth == 1 {
+					runHasBaselineOffset = false
+				}
+			case "rPr":
+				if runDepth > 0 && xmlAttrValue(t, "baseline") != "" && xmlAttrValue(t, "baseline") != "0" {
+					runHasBaselineOffset = true
+				}
+			case "br":
+				if tableDepth == 0 {
+					out = append(out, "\n")
+				}
+			case "graphicFrame":
+				graphicFrameDepth++
+			case "tbl":
+				if graphicFrameDepth > 0 {
+					tableDepth++
+				}
+			case "t":
+				if tableDepth > 0 {
+					continue
+				}
+				if t.Name.Space == "http://schemas.openxmlformats.org/officeDocument/2006/math" {
+					mathTextDepth++
+				} else {
+					textDepth++
+				}
+			case "p":
+				if tableDepth == 0 {
+					out = append(out, "\n")
+				}
+			}
+		case xml.EndElement:
+			switch t.Name.Local {
+			case "r", "fld":
+				if runDepth > 0 {
+					runDepth--
+					if runDepth == 0 {
+						runHasBaselineOffset = false
+					}
+				}
+			case "t":
+				if t.Name.Space == "http://schemas.openxmlformats.org/officeDocument/2006/math" && mathTextDepth > 0 {
+					mathTextDepth--
+				} else if textDepth > 0 {
+					textDepth--
+				}
+			case "tbl":
+				if tableDepth > 0 {
+					tableDepth--
+				}
+			case "graphicFrame":
+				if graphicFrameDepth > 0 {
+					graphicFrameDepth--
+				}
+			}
+		case xml.CharData:
+			if textDepth > 0 || mathTextDepth > 0 {
+				text := string(t)
+				if mathTextDepth > 0 {
+					text = strings.Map(pptxMathTextRune, text)
+				}
+				appendPptxVisibleTextSegment(&out, text, runHasBaselineOffset, &lastSegmentHasBaselineOffset)
+			}
+		}
+	}
+	// Slide text is authoritative content, including ordinary template labels
+	// such as "Click to add title".  The Markdown cleaner intentionally drops
+	// some short boilerplate-looking lines, which is appropriate for prose
+	// rendering but wrong for a COM TextRange baseline.
+	return cleanTextNoMojibakeRepair(strings.Join(out, "")), nil
+}
+
+// appendPptxVisibleTextSegment keeps superscript and subscript runs attached
+// to their mathematical base. PowerPoint's TextRange renders "A" + a raised
+// "2" + "x" as "A2x", while an XML-only run boundary has no implicit space.
+func appendPptxVisibleTextSegment(out *[]string, text string, runHasBaselineOffset bool, lastSegmentHasBaselineOffset *bool) {
+	if text == "" {
+		return
+	}
+	if !runHasBaselineOffset && !*lastSegmentHasBaselineOffset {
+		appendPptxOOXMLVisibleTextSegment(out, text)
+	} else {
+		*out = append(*out, text)
+	}
+	*lastSegmentHasBaselineOffset = runHasBaselineOffset
+}
+
+func appendPptxOOXMLVisibleTextSegment(out *[]string, text string) {
+	if len(*out) > 0 && pptxTextBoundaryNeedsSpace((*out)[len(*out)-1], text) {
+		*out = append(*out, " ")
+	}
+	*out = append(*out, text)
+}
+
+func pptxTextBoundaryNeedsSpace(left, right string) bool {
+	leftRunes, rightRunes := []rune(left), []rune(right)
+	if len(leftRunes) == 0 || len(rightRunes) == 0 {
+		return false
+	}
+	return ooxmlTextBoundaryNeedsSpace(left, right)
+}
+
+func appendOOXMLVisibleTextSegment(out *[]string, text string) {
+	if text == "" {
+		return
+	}
+	if len(*out) > 0 && ooxmlTextBoundaryNeedsSpace((*out)[len(*out)-1], text) {
+		*out = append(*out, " ")
+	}
+	*out = append(*out, text)
+}
+
+// PowerPoint's TextRange renders Office Math text using Cambria Math Unicode
+// code points. Math runs in OOXML usually store plain ASCII identifiers plus
+// style records (bold/italic/script); retain the visible characters here rather
+// than leaking raw XML markup or dropping the math object altogether.
+func pptxMathTextRune(r rune) rune {
+	if r >= 0xf000 && r <= 0xf0ff {
+		return r & 0xff
+	}
+	return r
 }
 
 func extractPptxMarkdown(files map[string]*zip.File) (string, error) {
@@ -2485,7 +2949,7 @@ func pptxSlideVisible(files map[string]*zip.File, name string) (bool, error) {
 	}
 }
 
-func extractXlsxText(files map[string]*zip.File) (string, map[string]xlsxWorksheetMarkdownData, error) {
+func extractXlsxText(files map[string]*zip.File, strictOfficeContent bool) (string, map[string]xlsxWorksheetMarkdownData, error) {
 	shared, err := readSharedStrings(files)
 	if err != nil {
 		return "", nil, err
@@ -2496,7 +2960,7 @@ func extractXlsxText(files map[string]*zip.File) (string, map[string]xlsxWorkshe
 	}
 	var out strings.Builder
 	markdown := map[string]xlsxWorksheetMarkdownData{}
-	workbookTexts, sheetNames, err := workbookTextAndSheets(files)
+	workbookTexts, sheetNames, err := workbookTextAndSheets(files, strictOfficeContent)
 	if err != nil {
 		return "", nil, err
 	}
@@ -2519,12 +2983,12 @@ func extractXlsxText(files map[string]*zip.File) (string, map[string]xlsxWorkshe
 			return "", nil, err
 		}
 		var md xlsxWorksheetMarkdownData
-		if err := appendWorksheetText(&out, b, shared, styles, &md); err != nil {
+		if err := appendWorksheetText(&out, b, shared, styles, &md, strictOfficeContent); err != nil {
 			return "", nil, err
 		}
 		markdown[ooxmlPartKey(name)] = md
 	}
-	if xlsxHasAnyPartPrefix(files, []string{"xl/charts/", "xl/drawings/", "xl/tables/", "xl/pivottables/", "xl/pivotcache/", "xl/slicers/", "xl/slicercaches/"}) {
+	if !strictOfficeContent && xlsxHasAnyPartPrefix(files, []string{"xl/charts/", "xl/drawings/", "xl/tables/", "xl/pivottables/", "xl/pivotcache/", "xl/slicers/", "xl/slicercaches/"}) {
 		var extraNames []string
 		visibleDrawingParts := xlsxVisibleDrawingPartNames(files)
 		visibleTableParts, constrainedTableParts := xlsxVisibleTablePartNames(files)
@@ -2549,7 +3013,7 @@ func extractXlsxText(files map[string]*zip.File) (string, map[string]xlsxWorkshe
 		}
 		appendCleanedTextBlocks(&out, extras)
 	}
-	if xlsxHasAnyPartPrefix(files, []string{"xl/comments", "xl/threadedcomments"}) {
+	if !strictOfficeContent && xlsxHasAnyPartPrefix(files, []string{"xl/comments", "xl/threadedcomments"}) {
 		comments, err := xlsxVisibleCommentsText(files)
 		if err != nil {
 			return "", nil, err
@@ -2638,6 +3102,107 @@ func xlsxVisibleChartPartNamesUncached(files map[string]*zip.File) (map[string]b
 		}
 	}
 	return visible, true
+}
+
+// docxStrictPictureRelationshipRefs mirrors Word's InlineShapes and Shapes
+// collections: a relationship counts only when it belongs to a DrawingML
+// picture (pic:pic) or a VML image element. Image fills, diagrams, and other
+// drawing resources can reference media but are exposed by Word as non-picture
+// shapes (for example msoTextBox or msoGraphic), not document images.
+func docxStrictPictureRelationshipRefs(b []byte) (docxImageRefs, error) {
+	refs := docxImageRefs{Visible: map[string]bool{}, Hidden: map[string]bool{}}
+	if hasDOCTYPE(b) {
+		return refs, errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	pictureDepth := 0
+	vmlImageDepth := 0
+	objectDepth := 0
+	for {
+		token, err := dec.Token()
+		if err == io.EOF {
+			return refs, nil
+		}
+		if err != nil {
+			return refs, err
+		}
+		switch t := token.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "object" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml") {
+				objectDepth++
+			}
+			if t.Name.Local == "pic" && strings.Contains(strings.ToLower(t.Name.Space), "picture") {
+				pictureDepth++
+			}
+			if t.Name.Local == "imagedata" && strings.Contains(strings.ToLower(t.Name.Space), "vml") {
+				vmlImageDepth++
+			}
+			if objectDepth == 0 && (pictureDepth > 0 || vmlImageDepth > 0) {
+				for _, id := range imageRelationshipIDs(t) {
+					refs.Visible[id] = true
+				}
+			}
+		case xml.EndElement:
+			if t.Name.Local == "object" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml") && objectDepth > 0 {
+				objectDepth--
+			}
+			if t.Name.Local == "pic" && strings.Contains(strings.ToLower(t.Name.Space), "picture") && pictureDepth > 0 {
+				pictureDepth--
+			}
+			if t.Name.Local == "imagedata" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && vmlImageDepth > 0 {
+				vmlImageDepth--
+			}
+		}
+	}
+}
+
+// docxStrictPictureRelationshipIDsInOrder is the occurrence-preserving form
+// of docxStrictPictureRelationshipRefs.  It deliberately records duplicate
+// r:embed/r:link values because Word exposes each picture placement as an
+// individual InlineShape or Shape.
+func docxStrictPictureRelationshipIDsInOrder(b []byte) ([]string, error) {
+	if hasDOCTYPE(b) {
+		return nil, errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	pictureDepth := 0
+	vmlImageDepth := 0
+	objectDepth := 0
+	var ids []string
+	for {
+		token, err := dec.Token()
+		if err == io.EOF {
+			return ids, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch t := token.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "object" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml") {
+				objectDepth++
+			}
+			if t.Name.Local == "pic" && strings.Contains(strings.ToLower(t.Name.Space), "picture") {
+				pictureDepth++
+			}
+			if t.Name.Local == "imagedata" && strings.Contains(strings.ToLower(t.Name.Space), "vml") {
+				vmlImageDepth++
+			}
+			if objectDepth == 0 && (pictureDepth > 0 || vmlImageDepth > 0) {
+				ids = append(ids, imageRelationshipIDs(t)...)
+			}
+		case xml.EndElement:
+			if t.Name.Local == "object" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml") && objectDepth > 0 {
+				objectDepth--
+			}
+			if t.Name.Local == "pic" && strings.Contains(strings.ToLower(t.Name.Space), "picture") && pictureDepth > 0 {
+				pictureDepth--
+			}
+			if t.Name.Local == "imagedata" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && vmlImageDepth > 0 {
+				vmlImageDepth--
+			}
+		}
+	}
 }
 
 func collectXlsxSourceVisibleChartParts(files map[string]*zip.File, source string, visible, hidden, seen map[string]bool) (bool, bool) {
@@ -4238,11 +4803,11 @@ func workbookSheets(files map[string]*zip.File) ([]workbookSheet, error) {
 }
 
 func workbookText(files map[string]*zip.File) ([]string, error) {
-	text, _, err := workbookTextAndSheets(files)
+	text, _, err := workbookTextAndSheets(files, false)
 	return text, err
 }
 
-func workbookTextAndSheets(files map[string]*zip.File) ([]string, []string, error) {
+func workbookTextAndSheets(files map[string]*zip.File, strictOfficeContent bool) ([]string, []string, error) {
 	f := ooxmlFile(files, "xl/workbook.xml")
 	if f == nil {
 		return nil, nil, nil
@@ -4309,6 +4874,14 @@ func workbookTextAndSheets(files map[string]*zip.File) ([]string, []string, erro
 				}
 				sheetIndex++
 			case "definedName":
+				// Excel's UsedRange.Text exposes worksheet cells and visible sheet
+				// names, not workbook-level named ranges.  Keep names in the
+				// compatibility text/structured Markdown paths, but exclude them
+				// from the Office-COM comparison path so a named range that repeats
+				// a cell label is not counted as a second visible occurrence.
+				if strictOfficeContent {
+					break
+				}
 				inDefinedName = true
 				cur.Reset()
 				hidden := false
@@ -4885,6 +5458,14 @@ func isPropertyTextElement(name string) bool {
 }
 
 func visibleXMLText(b []byte) (string, error) {
+	return visibleXMLTextWithAttributes(b, true)
+}
+
+func visibleXMLTextWithoutAttributes(b []byte) (string, error) {
+	return visibleXMLTextWithAttributes(b, false)
+}
+
+func visibleXMLTextWithAttributes(b []byte, includeAttributes bool) (string, error) {
 	if hasDOCTYPE(b) {
 		return "", errors.New("xml doctype is not supported")
 	}
@@ -5002,7 +5583,7 @@ func visibleXMLText(b []byte) (string, error) {
 			}
 			hiddenByRevisionRange := hiddenRevisionRangeDepth > 0
 			contentVisible := !runHidden && !currentParagraphHidden(paragraphHiddenStack) && !drawingObjectHidden && !hiddenByRevisionRange
-			if contentVisible {
+			if contentVisible && includeAttributes {
 				for _, value := range visibleAttributeText(t) {
 					if seenAttrs[value] {
 						continue
@@ -6277,11 +6858,22 @@ func visibleSymbolRune(r rune) bool {
 }
 
 func isFontEncodedSymbolFont(font string) bool {
-	return strings.Contains(font, "symbol") || strings.Contains(font, "wingdings")
+	font = strings.ToLower(font)
+	return strings.Contains(font, "symbol") || strings.Contains(font, "wingdings") || strings.Contains(font, "webdings")
 }
 
 func fontEncodedSymbolRune(font string, code rune) (rune, bool) {
 	switch {
+	case strings.Contains(font, "webdings"):
+		// Word exposes these Webdings glyphs as parentheses in TextRange.Text.
+		// They appear in documents normalized by the Open XML SDK, which stores
+		// the original glyph code rather than the textual fallback.
+		switch code {
+		case 0x45, 0x49, 0x4a:
+			return '(', true
+		default:
+			return 0, false
+		}
 	case strings.Contains(font, "wingdings"):
 		switch code {
 		case 0xfc:
@@ -6397,6 +6989,8 @@ func fontEncodedSymbolRune(font string, code rune) (rune, bool) {
 			return '\u03c8', true
 		case 0x7a:
 			return '\u03b6', true
+		case 0xd7:
+			return '\u00d7', true
 		default:
 			return 0, false
 		}
@@ -8509,22 +9103,26 @@ func isExcelPhoneticElement(name string) bool {
 	}
 }
 
-type xlsxCellStyles []string
+type xlsxCellStyles struct {
+	numFmtIDs []string
+	formats   map[string]string
+}
 
 func readXlsxCellStyles(files map[string]*zip.File) (xlsxCellStyles, error) {
 	f := ooxmlFile(files, "xl/styles.xml")
 	if f == nil {
-		return nil, nil
+		return xlsxCellStyles{}, nil
 	}
 	b, err := readZipFile(f)
 	if err != nil {
-		return nil, err
+		return xlsxCellStyles{}, err
 	}
 	if hasDOCTYPE(b) {
-		return nil, errors.New("xml doctype is not supported")
+		return xlsxCellStyles{}, errors.New("xml doctype is not supported")
 	}
 	dec := xml.NewDecoder(bytes.NewReader(b))
-	var styles xlsxCellStyles
+	styles := xlsxCellStyles{formats: map[string]string{}}
+	inNumFmts := false
 	inCellXfs := false
 	for {
 		tok, err := dec.Token()
@@ -8532,10 +9130,29 @@ func readXlsxCellStyles(files map[string]*zip.File) (xlsxCellStyles, error) {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return xlsxCellStyles{}, err
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
+			if t.Name.Local == "numFmts" {
+				inNumFmts = true
+				continue
+			}
+			if inNumFmts && t.Name.Local == "numFmt" {
+				var id, code string
+				for _, a := range t.Attr {
+					switch a.Name.Local {
+					case "numFmtId":
+						id = a.Value
+					case "formatCode":
+						code = a.Value
+					}
+				}
+				if id != "" && code != "" {
+					styles.formats[id] = code
+				}
+				continue
+			}
 			if t.Name.Local == "cellXfs" {
 				inCellXfs = true
 				continue
@@ -8550,8 +9167,11 @@ func readXlsxCellStyles(files map[string]*zip.File) (xlsxCellStyles, error) {
 					break
 				}
 			}
-			styles = append(styles, id)
+			styles.numFmtIDs = append(styles.numFmtIDs, id)
 		case xml.EndElement:
+			if t.Name.Local == "numFmts" {
+				inNumFmts = false
+			}
 			if t.Name.Local == "cellXfs" {
 				inCellXfs = false
 			}
@@ -8560,7 +9180,7 @@ func readXlsxCellStyles(files map[string]*zip.File) (xlsxCellStyles, error) {
 	return styles, nil
 }
 
-func xlsxDisplayNumber(value, style string) string {
+func xlsxDisplayNumber(value, style string, formats map[string]string) string {
 	if style == "" || !plainExcelNumberValue(value) {
 		return value
 	}
@@ -8573,20 +9193,196 @@ func xlsxDisplayNumber(value, style string) string {
 	if style == "0" || style == "82" {
 		return strconv.FormatFloat(n, 'g', 14, 64)
 	}
+	if displayed, ok := xlsxDisplayBuiltInNumber(n, style); ok {
+		return displayed
+	}
+	if format, ok := formats[style]; ok {
+		if displayed, ok := xlsxDisplayCustomNumber(n, format); ok {
+			return displayed
+		}
+	}
 	return value
 }
 
-func xlsxDisplayNumberForCell(value string, styleIndex int, styles xlsxCellStyles) string {
-	if styleIndex < 0 || styleIndex >= len(styles) {
-		return value
+// xlsxDisplayBuiltInNumber handles the small set of built-in formats that
+// occur frequently in generated workbooks. Custom formats are stored in
+// styles.xml, but built-in IDs (notably 9 and 10 for percentages) are not.
+func xlsxDisplayBuiltInNumber(n float64, style string) (string, bool) {
+	switch style {
+	case "1": // 0
+		return strconv.FormatFloat(xlsxRoundDisplayNumber(n, 0), 'f', 0, 64), true
+	case "2": // 0.00
+		return strconv.FormatFloat(xlsxRoundDisplayNumber(n, 2), 'f', 2, 64), true
+	case "3": // #,##0
+		return insertThousandsSeparators(strconv.FormatFloat(xlsxRoundDisplayNumber(n, 0), 'f', 0, 64)), true
+	case "4": // #,##0.00
+		text := strconv.FormatFloat(xlsxRoundDisplayNumber(n, 2), 'f', 2, 64)
+		whole, frac, _ := strings.Cut(text, ".")
+		return insertThousandsSeparators(whole) + "." + frac, true
+	case "9": // 0%
+		return strconv.FormatFloat(xlsxRoundDisplayNumber(n*100, 0), 'f', 0, 64) + "%", true
+	case "10": // 0.00%
+		return strconv.FormatFloat(xlsxRoundDisplayNumber(n*100, 2), 'f', 2, 64) + "%", true
+	case "11": // 0.00E+00
+		return strings.ReplaceAll(strconv.FormatFloat(n, 'E', 2, 64), "E+0", "E+"), true
 	}
-	return xlsxDisplayNumber(value, styles[styleIndex])
+	return "", false
 }
 
-func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles xlsxCellStyles, md *xlsxWorksheetMarkdownData) error {
+// xlsxGeneralDisplayNumberForWidth approximates Excel's General rendering in
+// a cell with a finite column width.  Unlike a raw number-format conversion,
+// Range.Text is constrained by the rendered column: Excel retains as many
+// decimal places as fit, then switches small values to scientific notation.
+func xlsxGeneralDisplayNumberForWidth(n float64, width int) string {
+	if n == 0 {
+		return "0"
+	}
+	abs := math.Abs(n)
+	if width < 3 {
+		width = 3
+	}
+	if abs >= math.Pow10(width-1) || abs < 1e-4 {
+		return strings.ReplaceAll(strconv.FormatFloat(n, 'e', 2, 64), "e", "E")
+	}
+	digitsBefore := 1
+	if abs >= 1 {
+		digitsBefore = int(math.Floor(math.Log10(abs))) + 1
+	}
+	decimals := width - digitsBefore - 1 // decimal point consumes one column.
+	if decimals < 0 {
+		decimals = 0
+	}
+	text := strconv.FormatFloat(xlsxRoundDisplayNumber(n, decimals), 'f', decimals, 64)
+	if strings.Contains(text, ".") {
+		text = strings.TrimRight(strings.TrimRight(text, "0"), ".")
+	}
+	return text
+}
+
+func xlsxDisplayCustomNumber(n float64, format string) (string, bool) {
+	// Minimal custom-format support for the commonly used currency/decimal
+	// forms. It intentionally refuses complex conditional and date formats.
+	if strings.ContainsAny(format, "[];@") || strings.ContainsAny(format, "dDyYmMhHsS") {
+		return "", false
+	}
+	quoted := ""
+	for len(format) > 0 {
+		start := strings.IndexByte(format, '"')
+		if start < 0 {
+			break
+		}
+		end := strings.IndexByte(format[start+1:], '"')
+		if end < 0 {
+			break
+		}
+		quoted += format[start+1 : start+1+end]
+		format = format[:start] + format[start+2+end:]
+	}
+	decimal := 0
+	if point := strings.IndexByte(format, '.'); point >= 0 {
+		for _, r := range format[point+1:] {
+			if r == '0' || r == '#' {
+				decimal++
+			}
+		}
+	}
+	if !strings.ContainsAny(format, "0#") {
+		return "", false
+	}
+	text := strconv.FormatFloat(xlsxRoundDisplayNumber(n, decimal), 'f', decimal, 64)
+	if strings.Contains(format, ",") {
+		whole, frac, hasFrac := strings.Cut(text, ".")
+		whole = insertThousandsSeparators(whole)
+		text = whole
+		if hasFrac {
+			text += "." + frac
+		}
+	}
+	return quoted + text, true
+}
+
+// Excel rounds formatted decimal values half away from zero, whereas Go's
+// FormatFloat follows IEEE round-to-even for an exact halfway value.
+func xlsxRoundDisplayNumber(n float64, decimal int) float64 {
+	scale := math.Pow10(decimal)
+	if n < 0 {
+		return math.Ceil(n*scale-0.5) / scale
+	}
+	return math.Floor(n*scale+0.5) / scale
+}
+
+func insertThousandsSeparators(value string) string {
+	sign := ""
+	if strings.HasPrefix(value, "-") {
+		sign, value = "-", value[1:]
+	}
+	for i := len(value) - 3; i > 0; i -= 3 {
+		value = value[:i] + "," + value[i:]
+	}
+	return sign + value
+}
+
+func xlsxDisplayNumberForCell(value string, styleIndex int, styles xlsxCellStyles) string {
+	if styleIndex < 0 || styleIndex >= len(styles.numFmtIDs) {
+		return value
+	}
+	return xlsxDisplayNumber(value, styles.numFmtIDs[styleIndex], styles.formats)
+}
+
+func xlsxDisplayNumberForCellWidth(value string, styleIndex int, styles xlsxCellStyles, width int) string {
+	if styleIndex < 0 || styleIndex >= len(styles.numFmtIDs) {
+		return value
+	}
+	style := styles.numFmtIDs[styleIndex]
+	if (style != "0" && style != "82") || !plainExcelNumberValue(value) {
+		return xlsxDisplayNumber(value, style, styles.formats)
+	}
+	n, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return value
+	}
+	return xlsxGeneralDisplayNumberForWidth(n, width)
+}
+
+func xlsxColumnWidthInto(widths map[int]int, start xml.StartElement) {
+	minCol, maxCol := 0, 0
+	width := 0.0
+	for _, a := range start.Attr {
+		switch a.Name.Local {
+		case "min":
+			minCol, _ = atoi(a.Value)
+		case "max":
+			maxCol, _ = atoi(a.Value)
+		case "width":
+			width, _ = strconv.ParseFloat(a.Value, 64)
+		}
+	}
+	if minCol < 1 || maxCol < minCol || width <= 0 {
+		return
+	}
+	// Excel's column width unit is roughly a character count in the Normal
+	// font; reserve one character for the text margin/rounding behavior.
+	characters := int(math.Floor(width)) - 1
+	if characters < 3 {
+		characters = 3
+	}
+	for col := minCol; col <= maxCol; col++ {
+		widths[col] = characters
+	}
+}
+
+func xlsxColumnDisplayWidth(widths map[int]int, column int) int {
+	if width, ok := widths[column]; ok {
+		return width
+	}
+	// Excel's default Calibri 11 column width is 8.43 characters.
+	return 8
+}
+
+func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles xlsxCellStyles, md *xlsxWorksheetMarkdownData, strictOfficeContent bool) error {
 	// The fast paths do not parse cell styles. Use the XML reader whenever a
 	// workbook has styles so numeric cells can match Excel's displayed value.
-	if len(styles) == 0 {
+	if len(styles.numFmtIDs) == 0 {
 		if ok, err := appendSimpleInlineWorksheetText(out, b, md); ok || err != nil {
 			return err
 		}
@@ -8596,7 +9392,12 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 	}
 	dec := xml.NewDecoder(bytes.NewReader(b))
 	var cellType string
-	cellStyle := -1
+	// OOXML cells without an explicit s attribute use cellXfs[0].  Treating
+	// them as unstyled leaks cached binary floating-point values (for example
+	// 0.14078153727589526) where Excel's Range.Text displays General-formatted
+	// values.  This is especially common in workbooks generated by numerical
+	// tools, which only write s for the exceptional percentage/currency cells.
+	cellStyle := 0
 	var inV, inT bool
 	var inHeaderFooter bool
 	var rowHidden bool
@@ -8605,6 +9406,7 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 	var collectMarkdownCell bool
 	var markdownRowValues []string
 	var hiddenCols []intRange
+	columnWidths := map[int]int{}
 	var hiddenRows []intRange
 	currentRow := 0
 	nextRow := 1
@@ -8632,6 +9434,7 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 				if r, ok := hiddenColumnRange(t); ok {
 					hiddenCols = append(hiddenCols, r)
 				}
+				xlsxColumnWidthInto(columnWidths, t)
 			}
 			if t.Name.Local == "row" {
 				rowHidden = worksheetRowHidden(t)
@@ -8654,7 +9457,7 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 			if t.Name.Local == "c" {
 				cellDepth = 1
 				cellType = ""
-				cellStyle = -1
+				cellStyle = 0
 				cellRef := ""
 				collectMarkdownCell = false
 				for _, a := range t.Attr {
@@ -8678,7 +9481,11 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 					cellCol = 1
 				}
 				nextCol = cellCol + 1
-				skipCell = rowHidden || hiddenColumnCell(cellRef, hiddenCols) || columnHidden(cellCol, hiddenCols)
+				// Strict Office comparison follows Excel UsedRange.Text. It includes
+				// cells in hidden rows and columns; only hidden worksheets are
+				// excluded by the workbook-level sheet selection. Compatibility
+				// extraction keeps the historical visible-cell behavior.
+				skipCell = !strictOfficeContent && (rowHidden || hiddenColumnCell(cellRef, hiddenCols) || columnHidden(cellCol, hiddenCols))
 				collectMarkdownCell = !skipCell && collectMarkdownRow && markdownRowValues != nil && cellCol <= maxMarkdownTableCols
 				if collectMarkdownCell {
 					markdownCellText.Reset()
@@ -8731,11 +9538,13 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 				continue
 			}
 			if isExcelHeaderFooterElement(t.Name.Local) {
-				value := cleanExcelHeaderFooterText(cur.String())
-				if value != "" {
-					appendCleanedTextBlock(out, value)
-					if md != nil {
-						md.headerFooter = append(md.headerFooter, value)
+				if !strictOfficeContent {
+					value := cleanExcelHeaderFooterText(cur.String())
+					if value != "" {
+						appendCleanedTextBlock(out, value)
+						if md != nil {
+							md.headerFooter = append(md.headerFooter, value)
+						}
 					}
 				}
 				inHeaderFooter = false
@@ -8749,7 +9558,7 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 					switch {
 					case t.Name.Local == "v" && cellType == "s":
 						if idx, ok := atoi(value); ok && idx >= 0 && idx < len(shared) {
-							if len(shared[idx]) > maxRepeatedTextPartBytes {
+							if !strictOfficeContent && len(shared[idx]) > maxRepeatedTextPartBytes {
 								if seenLargeSharedIndexes != nil && seenLargeSharedIndexes[idx] {
 									skipValue = true
 									value = shared[idx]
@@ -8769,12 +9578,17 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 					case t.Name.Local == "t" && cellType == "inlineStr":
 						markdownValue = rawValue
 					}
-					if t.Name.Local == "v" && cellType == "" {
-						value = xlsxDisplayNumberForCell(value, cellStyle, styles)
+					if t.Name.Local == "v" && (cellType == "" || cellType == "n") {
+						value = xlsxDisplayNumberForCellWidth(value, cellStyle, styles, xlsxColumnDisplayWidth(columnWidths, cellCol))
 						markdownValue = value
 					}
 					if !skipValue {
-						if t.Name.Local == "v" && cellType == "" && plainExcelNumberValue(value) {
+						if strictOfficeContent {
+							// UsedRange.Text returns every visible cell occurrence. Do
+							// not let generic binary-text cleanup collapse legitimate
+							// worksheet literals such as "wml.xsd or dml__ROOT".
+							appendTrimmedTextBlock(out, strings.TrimSpace(value))
+						} else if t.Name.Local == "v" && (cellType == "" || cellType == "n") && plainExcelNumberValue(value) {
 							appendTrimmedTextBlock(out, value)
 						} else {
 							appendWorksheetValue(out, value, &seenLargeValues)
@@ -10357,6 +11171,9 @@ func extractOOXMLImages(files map[string]*zip.File, kind string, includeMetadata
 	}
 	visibleMedia, filterMedia := visibleOOXMLMediaParts(files, kind)
 	strict := len(strictOfficeImages) > 0 && strictOfficeImages[0]
+	if strict && kind == "docx" {
+		visibleMedia, filterMedia = strictDocxVisibleMediaParts(files)
+	}
 	if strict && kind == "pptx" {
 		visibleMedia, filterMedia = strictPptxVisibleMediaParts(files)
 	}
@@ -10399,6 +11216,222 @@ func extractOOXMLImages(files map[string]*zip.File, kind string, includeMetadata
 		images = append(images, img)
 	}
 	return images, nil
+}
+
+// strictDocxVisibleMediaParts mirrors Word's Document.InlineShapes and
+// Document.Shapes collections.  These collections belong to the main
+// document story, not headers, footers, comments, or glossary documents.
+func strictDocxVisibleMediaParts(files map[string]*zip.File) (map[string]bool, bool) {
+	document := ooxmlPartName(files, "word/document.xml")
+	if document == "" {
+		return nil, false
+	}
+	b, err := readZipFile(ooxmlFile(files, document))
+	if err != nil {
+		return nil, false
+	}
+	refs, err := docxStrictPictureRelationshipRefs(b)
+	if err != nil {
+		return nil, false
+	}
+	rels, err := relationshipTargetMapForPart(files, document)
+	if err != nil {
+		return nil, false
+	}
+	visible := map[string]bool{}
+	for id := range refs.Visible {
+		if part := docxRelationshipMediaPart(files, document, rels[id]); part != "" {
+			visible[part] = true
+		}
+	}
+	return visible, true
+}
+
+// docxStrictVisibleImageOccurrences mirrors Word's Document.InlineShapes and
+// Document.Shapes collections.  Unlike the package media directory, those
+// collections preserve each placement of a picture: one media part may be
+// displayed several times in the document and must therefore produce several
+// extracted image occurrences.
+func docxStrictVisibleImageOccurrences(files map[string]*zip.File, images []Image) []Image {
+	document := ooxmlPartName(files, "word/document.xml")
+	if document == "" {
+		return images
+	}
+	b, err := readZipFile(ooxmlFile(files, document))
+	if err != nil {
+		return images
+	}
+	ids, err := docxStrictPictureRelationshipIDsInOrder(b)
+	if err != nil {
+		return images
+	}
+	rels, err := relationshipTargetMapForPart(files, document)
+	if err != nil {
+		return images
+	}
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if part := docxRelationshipMediaPart(files, document, rels[id]); part != "" {
+			parts = append(parts, part)
+		}
+	}
+	return ooxmlImageOccurrencesForParts(parts, images)
+}
+
+func xlsxStrictVisibleImageOccurrences(files map[string]*zip.File, images []Image) []Image {
+	media, found := xlsxStrictVisibleMediaOccurrenceNames(files)
+	if !found {
+		return images
+	}
+	byPart := map[string][]Image{}
+	for _, image := range images {
+		key := strings.ToLower(image.Name)
+		byPart[key] = append(byPart[key], image)
+	}
+	var out []Image
+	for _, part := range media {
+		name := imageNameWithExt(ooxmlImageOutputBaseName(part), strings.ToLower(path.Ext(part)))
+		key := strings.ToLower(name)
+		available := byPart[key]
+		if len(available) == 0 {
+			base := strings.ToLower(strings.TrimSuffix(ooxmlImageOutputBaseName(part), path.Ext(ooxmlImageOutputBaseName(part))))
+			for candidate, values := range byPart {
+				if len(values) > 0 && strings.EqualFold(strings.TrimSuffix(candidate, path.Ext(candidate)), base) {
+					key, available = candidate, values
+					break
+				}
+			}
+		}
+		if len(available) == 0 {
+			continue
+		}
+		out = append(out, available[0])
+	}
+	return out
+}
+
+// pptxStrictVisibleImageOccurrences mirrors PowerPoint's Slide.Shapes
+// collection. A media part can be used by several top-level Picture Shapes;
+// keep every visible shape occurrence instead of returning one image per ZIP
+// part. Group members and OLE previews are deliberately excluded because the
+// COM baseline enumerates only top-level msoPicture/msoLinkedPicture shapes.
+//
+// Callers must pass the pre-filtered image set: a drawing can legitimately
+// reuse one media part, whereas an orphaned media part must never be revived
+// merely because its basename happens to match a visible relationship.
+func pptxStrictVisibleImageOccurrences(files map[string]*zip.File, images []Image) []Image {
+	media, found := pptxStrictVisibleMediaOccurrenceNames(files)
+	if !found {
+		return images
+	}
+	return ooxmlImageOccurrencesForParts(media, images)
+}
+
+func ooxmlImageOccurrencesForParts(parts []string, images []Image) []Image {
+	byName := map[string][]Image{}
+	for _, image := range images {
+		key := strings.ToLower(image.Name)
+		byName[key] = append(byName[key], image)
+	}
+	out := make([]Image, 0, len(parts))
+	for _, part := range parts {
+		baseName := ooxmlImageOutputBaseName(part)
+		name := imageNameWithExt(baseName, strings.ToLower(path.Ext(part)))
+		key := strings.ToLower(name)
+		available := byName[key]
+		if len(available) == 0 {
+			base := strings.ToLower(strings.TrimSuffix(baseName, path.Ext(baseName)))
+			for candidate, values := range byName {
+				if len(values) > 0 && strings.EqualFold(strings.TrimSuffix(candidate, path.Ext(candidate)), base) {
+					available = values
+					break
+				}
+			}
+		}
+		if len(available) > 0 {
+			out = append(out, available[0])
+		}
+	}
+	return out
+}
+
+func ooxmlImagesForParts(parts map[string]bool, images []Image) []Image {
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make([]Image, 0, len(images))
+	for _, image := range images {
+		for part := range parts {
+			baseName := ooxmlImageOutputBaseName(part)
+			name := imageNameWithExt(baseName, strings.ToLower(path.Ext(part)))
+			if strings.EqualFold(image.Name, name) {
+				out = append(out, image)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func xlsxStrictVisibleMediaOccurrenceNames(files map[string]*zip.File) ([]string, bool) {
+	sheets, err := workbookVisibleSheets(files)
+	if err != nil || len(sheets) == 0 {
+		return nil, false
+	}
+	var out []string
+	foundDrawing := false
+	for _, sheet := range sheets {
+		for _, drawing := range relationshipTargetsWithPrefix(files, sheet.Path, "xl/drawings/") {
+			refs, err := xlsxDrawingImageRefsInOrder(files, drawing)
+			if err != nil {
+				continue
+			}
+			if len(refs) == 0 {
+				continue
+			}
+			foundDrawing = true
+			rels, err := relationshipTargetMapForPart(files, drawing)
+			if err != nil {
+				continue
+			}
+			for _, id := range refs {
+				if media := relationshipMediaPart(files, drawing, rels[id], "xl/media/"); media != "" {
+					out = append(out, media)
+				}
+			}
+		}
+	}
+	return out, foundDrawing
+}
+
+func xlsxDrawingImageRefsInOrder(files map[string]*zip.File, drawing string) ([]string, error) {
+	b, err := readZipFile(ooxmlFile(files, drawing))
+	if err != nil {
+		return nil, err
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	var refs []string
+	for {
+		tok, err := dec.RawToken()
+		if errors.Is(err, io.EOF) {
+			return refs, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch value := tok.(type) {
+		case xml.StartElement:
+			if value.Name.Local == "blip" {
+				for _, attr := range value.Attr {
+					if attr.Name.Local == "embed" || attr.Name.Local == "link" {
+						if id := strings.TrimSpace(attr.Value); id != "" {
+							refs = append(refs, id)
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 func ooxmlImageOutputBaseName(name string) string {
@@ -10578,9 +11611,11 @@ func docxImageRelationshipRefs(b []byte) (docxImageRefs, error) {
 	var hiddenRevisionDepth int
 	var hiddenRevisionRangeDepth int
 	var drawingObjectStack []bool
+	var drawingImageStack []bool
 	var paragraphHiddenStack []bool
 	var alternateStack []alternateContentState
 	var skipDepth int
+	var backgroundDepth int
 	var runDepth int
 	var rPrDepth int
 	var pPrDepth int
@@ -10617,12 +11652,24 @@ func docxImageRelationshipRefs(b []byte) (docxImageRefs, error) {
 					hiddenRevisionRangeDepth--
 				}
 			}
+			// Word stores a document-page background as w:background with a
+			// relationship to its tile image.  It is rendered behind the page, but
+			// Word does not expose it from either Document.InlineShapes or
+			// Document.Shapes, which are the strict Office image baseline.
+			if t.Name.Local == "background" {
+				backgroundDepth++
+			}
 			if isDrawingObjectElement(t.Name.Local) {
 				parentHidden := len(drawingObjectStack) > 0 && drawingObjectStack[len(drawingObjectStack)-1]
 				drawingObjectStack = append(drawingObjectStack, parentHidden)
+				parentImageHidden := len(drawingImageStack) > 0 && drawingImageStack[len(drawingImageStack)-1]
+				drawingImageStack = append(drawingImageStack, parentImageHidden)
 			}
 			if len(drawingObjectStack) > 0 && drawingObjectElementHidden(t) {
 				drawingObjectStack[len(drawingObjectStack)-1] = true
+			}
+			if len(drawingImageStack) > 0 && drawingObjectElementExplicitlyHidden(t) {
+				drawingImageStack[len(drawingImageStack)-1] = true
 			}
 			switch t.Name.Local {
 			case "p":
@@ -10646,10 +11693,10 @@ func docxImageRelationshipRefs(b []byte) (docxImageRefs, error) {
 					paragraphHiddenStack[len(paragraphHiddenStack)-1] = true
 				}
 			}
-			hidden := hiddenRevisionDepth > 0 || hiddenRevisionRangeDepth > 0 || runHidden || currentParagraphHidden(paragraphHiddenStack) ||
-				(len(drawingObjectStack) > 0 && drawingObjectStack[len(drawingObjectStack)-1])
+			imageHidden := backgroundDepth > 0 || hiddenRevisionDepth > 0 || hiddenRevisionRangeDepth > 0 || runHidden || currentParagraphHidden(paragraphHiddenStack) ||
+				(len(drawingImageStack) > 0 && drawingImageStack[len(drawingImageStack)-1])
 			for _, id := range imageRelationshipIDs(t) {
-				if hidden {
+				if imageHidden {
 					refs.Hidden[id] = true
 				} else {
 					refs.Visible[id] = true
@@ -10662,6 +11709,9 @@ func docxImageRelationshipRefs(b []byte) (docxImageRefs, error) {
 			}
 			if alternateContentEnd(t.Name.Local, &alternateStack) {
 				continue
+			}
+			if t.Name.Local == "background" && backgroundDepth > 0 {
+				backgroundDepth--
 			}
 			if t.Name.Local == "pPr" && pPrDepth > 0 {
 				pPrDepth--
@@ -10684,6 +11734,7 @@ func docxImageRelationshipRefs(b []byte) (docxImageRefs, error) {
 			}
 			if isDrawingObjectElement(t.Name.Local) && len(drawingObjectStack) > 0 {
 				drawingObjectStack = drawingObjectStack[:len(drawingObjectStack)-1]
+				drawingImageStack = drawingImageStack[:len(drawingImageStack)-1]
 			}
 			if hiddenRevisionDepth > 0 {
 				hiddenRevisionDepth--
@@ -10691,6 +11742,10 @@ func docxImageRelationshipRefs(b []byte) (docxImageRefs, error) {
 		}
 	}
 	return refs, nil
+}
+
+func drawingObjectElementExplicitlyHidden(start xml.StartElement) bool {
+	return vmlElementHidden(start)
 }
 
 func xlsxImageRelationshipRefs(b []byte) (docxImageRefs, error) {
@@ -11062,29 +12117,235 @@ func strictPptxVisibleMediaParts(files map[string]*zip.File) (map[string]bool, b
 		if f == nil {
 			return nil, false
 		}
-		b, err := readZipFile(f)
-		if err != nil {
+		occurrences, ok := pptxStrictSlidePictureMediaOccurrences(files, slide, f)
+		if !ok {
 			return nil, false
 		}
-		refs, err := pptxPictureRelationshipRefs(b)
-		if err != nil {
+		for _, part := range occurrences {
+			visible[part] = true
+		}
+	}
+	// An empty set is meaningful: it means the presentation has no top-level
+	// Picture Shapes.  Keep filtering enabled so orphaned/master media does not
+	// fall back into StrictOfficeImages merely because no slide picture exists.
+	return visible, true
+}
+
+func pptxStrictVisibleMediaOccurrenceNames(files map[string]*zip.File) ([]string, bool) {
+	slides, _, err := pptxCandidateSlideNames(files)
+	if err != nil || len(slides) == 0 {
+		return nil, false
+	}
+	var out []string
+	for _, slide := range slides {
+		visible, err := pptxSlideVisible(files, slide)
+		if err != nil || !visible {
+			continue
+		}
+		f := ooxmlFile(files, slide)
+		if f == nil {
 			return nil, false
 		}
-		rels, err := relationshipTargetMapForPart(files, slide)
-		if err != nil {
+		occurrences, ok := pptxStrictSlidePictureMediaOccurrences(files, slide, f)
+		if !ok {
 			return nil, false
 		}
-		for id := range refs.Visible {
-			collectRelationshipTargetMedia(files, slide, rels[id], "ppt/media/", visible)
-		}
-		for _, target := range rels {
-			part := resolveOOXMLRelationshipTarget(slide, target)
-			if strings.Contains(strings.ToLower(ooxmlPartKey(part)), "ppt/charts/") {
-				collectReachableOOXMLMedia(files, part, "ppt/media/", visible, map[string]bool{})
+		out = append(out, occurrences...)
+	}
+	return out, true
+}
+
+// pptxStrictSlidePictureMediaOccurrences follows both image encodings which
+// PowerPoint surfaces through Slide.Shapes: DrawingML p:pic elements in the
+// slide itself and VML v:shape/v:imagedata elements reached through the
+// slide's vmlDrawing relationship.  HTML-originated presentations commonly
+// retain the latter and PowerPoint exposes each as msoPicture.
+func pptxStrictSlidePictureMediaOccurrences(files map[string]*zip.File, slide string, slideFile *zip.File) ([]string, bool) {
+	b, err := readZipFile(slideFile)
+	if err != nil {
+		return nil, false
+	}
+	ids, err := pptxPictureRelationshipIDOccurrences(b)
+	if err != nil {
+		return nil, false
+	}
+	rels, err := relationshipTargetMapForPart(files, slide)
+	if err != nil {
+		return nil, false
+	}
+	var out []string
+	appendMedia := func(source string, ids []string, targets map[string]string) {
+		for _, id := range ids {
+			part := resolveOOXMLRelationshipTarget(source, targets[id])
+			if actual := ooxmlPartName(files, part); actual != "" {
+				part = actual
+			}
+			if strings.HasPrefix(ooxmlPartKey(part), "ppt/media/") {
+				out = append(out, part)
 			}
 		}
 	}
-	return visible, true
+	appendMedia(slide, ids, rels)
+	for _, target := range rels {
+		part := resolveOOXMLRelationshipTarget(slide, target)
+		if !strings.HasSuffix(ooxmlPartKey(part), ".vml") {
+			continue
+		}
+		vml := ooxmlFile(files, part)
+		if vml == nil {
+			return nil, false
+		}
+		vmlData, err := readZipFile(vml)
+		if err != nil {
+			return nil, false
+		}
+		vmlIDs, err := pptxVMLPictureRelationshipIDOccurrences(vmlData)
+		if err != nil {
+			// VML is optional legacy artwork. A malformed or unsupported VML
+			// cache must not discard the slide's valid DrawingML pictures.
+			continue
+		}
+		vmlPart := ooxmlPartName(files, part)
+		if vmlPart == "" {
+			vmlPart = part
+		}
+		vmlRels, err := relationshipTargetMapForPart(files, vmlPart)
+		if err != nil {
+			continue
+		}
+		appendMedia(vmlPart, vmlIDs, vmlRels)
+	}
+	return out, true
+}
+
+func pptxVMLPictureRelationshipIDOccurrences(b []byte) ([]string, error) {
+	if hasDOCTYPE(b) {
+		return nil, errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	shapeDepth := 0
+	hidden := false
+	var out []string
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return out, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "shape" && strings.Contains(strings.ToLower(t.Name.Space), "vml") {
+				if shapeDepth == 0 {
+					hidden = drawingObjectElementHidden(t)
+					// Legacy Office VML drawing parts use anonymous _x0000_s*
+					// PictureFrame caches. PowerPoint does not materialize these
+					// as Slide.Shapes. HTML-imported VML uses authored IDs (for
+					// example HTMLText1) and is exposed as msoPicture.
+					if strings.HasPrefix(strings.ToLower(xmlAttrValue(t, "id")), "_x0000_s") {
+						hidden = true
+					}
+				}
+				shapeDepth++
+			}
+			if shapeDepth > 0 && t.Name.Local == "imagedata" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && !hidden {
+				out = append(out, imageRelationshipIDs(t)...)
+			}
+		case xml.EndElement:
+			if t.Name.Local == "shape" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && shapeDepth > 0 {
+				shapeDepth--
+				if shapeDepth == 0 {
+					hidden = false
+				}
+			}
+		}
+	}
+}
+
+func pptxPictureRelationshipIDOccurrences(b []byte) ([]string, error) {
+	if hasDOCTYPE(b) {
+		return nil, errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	pictureDepth, oleObjectDepth := 0, 0
+	pictureHidden := false
+	var pictureRefs []string
+	var out []string
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return out, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "oleObj" {
+				oleObjectDepth++
+			}
+			if t.Name.Local == "pic" {
+				pictureDepth++
+				// OLE previews are a cached rendering of an embedded object, not a
+				// picture shape. Group members, in contrast, are rendered picture
+				// shapes exposed by PowerPoint through GroupItems and are retained.
+				if oleObjectDepth != 0 {
+					pictureHidden = true
+					continue
+				}
+				pictureHidden = false
+				pictureRefs = pictureRefs[:0]
+			}
+			if pictureDepth == 0 {
+				continue
+			}
+			if drawingObjectElementHidden(t) {
+				pictureHidden = true
+			}
+			// A picture placeholder (p:ph) inherits its artwork from the slide
+			// master/layout. Its embedded blip is a local placeholder cache, not a
+			// Picture entry in PowerPoint's Slide.Shapes collection.
+			if t.Name.Local == "ph" {
+				pictureHidden = true
+			}
+			// Windows Media Player ActiveX controls retain their poster frame as a
+			// p:pic cache. Likewise, video-file references use a p:pic only as the
+			// poster frame. PowerPoint materializes both as a media/control shape,
+			// not as an msoPicture in Slide.Shapes.
+			if pptxPictureIsMediaPlayerCache(t) {
+				pictureHidden = true
+			}
+			if t.Name.Local == "videoFile" {
+				pictureHidden = true
+			}
+			if !pictureHidden {
+				pictureRefs = append(pictureRefs, imageRelationshipIDs(t)...)
+			}
+		case xml.EndElement:
+			if t.Name.Local == "pic" && pictureDepth > 0 {
+				if pictureDepth == 1 && !pictureHidden {
+					out = append(out, pictureRefs...)
+				}
+				pictureDepth--
+				if pictureDepth == 0 {
+					pictureHidden = false
+					pictureRefs = nil
+				}
+			}
+			if t.Name.Local == "oleObj" && oleObjectDepth > 0 {
+				oleObjectDepth--
+			}
+		}
+	}
+}
+
+func pptxPictureIsMediaPlayerCache(start xml.StartElement) bool {
+	if start.Name.Local != "cNvPr" {
+		return false
+	}
+	name := strings.ToLower(strings.TrimSpace(xmlAttrValue(start, "name")))
+	return strings.HasPrefix(name, "windowsmediaplayer")
 }
 
 func collectPptxSlideVisibleMedia(files map[string]*zip.File, slide string, visible, hidden map[string]bool) bool {
@@ -11135,6 +12396,7 @@ func pptxPictureRelationshipRefs(b []byte) (docxImageRefs, error) {
 	pictureDepth := 0
 	pictureHidden := false
 	oleObjectDepth := 0
+	groupDepth := 0
 	for {
 		tok, err := dec.Token()
 		if errors.Is(err, io.EOF) {
@@ -11148,11 +12410,14 @@ func pptxPictureRelationshipRefs(b []byte) (docxImageRefs, error) {
 			if t.Name.Local == "oleObj" {
 				oleObjectDepth++
 			}
+			if t.Name.Local == "grpSp" {
+				groupDepth++
+			}
 			if t.Name.Local == "pic" {
-				if oleObjectDepth == 0 && pictureDepth == 0 {
+				if oleObjectDepth == 0 && groupDepth == 0 && pictureDepth == 0 {
 					pictureHidden = false
 				}
-				if oleObjectDepth == 0 {
+				if oleObjectDepth == 0 && groupDepth == 0 {
 					pictureDepth++
 				}
 			}
@@ -11178,6 +12443,9 @@ func pptxPictureRelationshipRefs(b []byte) (docxImageRefs, error) {
 			}
 			if t.Name.Local == "oleObj" && oleObjectDepth > 0 {
 				oleObjectDepth--
+			}
+			if t.Name.Local == "grpSp" && groupDepth > 0 {
+				groupDepth--
 			}
 		}
 	}

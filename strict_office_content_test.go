@@ -6,6 +6,41 @@ import (
 	"testing"
 )
 
+func TestStrictPPTXContentKeepsTemplateLabels(t *testing.T) {
+	file := filepath.Join("testdata", "web-samples", "samples", "pptx", "00020964.pptx")
+	result, err := Extract(file, Options{StrictOfficeContent: true, StrictOfficeImages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"单击此处添加标题文字", "小标题", "报告人", "日期"} {
+		if !strings.Contains(result.Text, want) {
+			t.Fatalf("strict PPTX text missing %q: %q", want, result.Text)
+		}
+	}
+}
+
+func TestStrictPPTXContentIncludesGroupedShapeText(t *testing.T) {
+	file := filepath.Join("testdata", "web-samples", "samples", "pptx", "00024860.pptx")
+	result, err := Extract(file, Options{StrictOfficeContent: true, StrictOfficeImages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Text, "Total Consolidation") {
+		t.Fatalf("strict PPTX text must include visible grouped text: %q", result.Text)
+	}
+}
+
+func TestStrictPPTXContentIncludesTextBearingGraphicFrames(t *testing.T) {
+	file := filepath.Join("testdata", "web-samples", "samples", "pptx", "00024860.pptx")
+	result, err := Extract(file, Options{StrictOfficeContent: true, StrictOfficeImages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Text, "State of California") {
+		t.Fatalf("strict PPTX text must include graphic-frame text: %q", result.Text)
+	}
+}
+
 func TestStrictOfficeContentExcludesDOCXChartCache(t *testing.T) {
 	file := filepath.Join("testdata", "web-samples", "samples", "docx", "LibreOffice__core__chart2_qa_extras_data_docx_data_point_inherited_color.docx")
 	compatible, err := Extract(file, Options{})
