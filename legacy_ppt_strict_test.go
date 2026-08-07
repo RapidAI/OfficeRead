@@ -27,6 +27,34 @@ func TestStrictLegacyPPTWebSampleExcludesCarvedInternalImages(t *testing.T) {
 	}
 }
 
+func TestStrictLegacyPPTRepairsVerifiedFusedUSAphisTitle(t *testing.T) {
+	if got := pptRepairKnownFusedVisibleToken("USAPHIS investigation"); got != "US APHIS investigation" {
+		t.Fatalf("fused PPT title = %q", got)
+	}
+	result, err := Extract(filepath.Join("testdata", "web-samples", "samples", "ppt", "000008.ppt"), Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Text, "USAPHIS") || !strings.Contains(result.Text, "US APHIS") {
+		t.Fatalf("visible title was not repaired: %q", result.Text)
+	}
+}
+
+func TestPPTVisiblePictureBlipsDescendsIntoGroupedShapeContainers(t *testing.T) {
+	// PowerPoint counts a picture nested in a group through GroupItems.  The
+	// outer group SpContainer is not itself a picture, so a traversal that
+	// returns after seeing it silently loses the nested occurrence.
+	fspPayload := make([]byte, 8)
+	binary.LittleEndian.PutUint32(fspPayload[4:], 0x0a00)
+	fsp := pptRecordWithOptionsForTest(uint16(75<<4), 0xf00a, fspPayload)
+	fopt := pptRecordWithOptionsForTest(0, 0xf00b, []byte{0x04, 0x01, 0x01, 0x00, 0x00, 0x00})
+	picture := pptContainerRecord(0xf004, append(fsp, fopt...))
+	group := pptContainerRecord(0xf004, picture)
+	if got := pptVisiblePictureBlips(group); !reflect.DeepEqual(got, []uint32{1}) {
+		t.Fatalf("grouped visible picture blips = %#v, want [1]", got)
+	}
+}
+
 func TestStrictLegacyPPTReadsVisibleWordArtTextEffectProperty(t *testing.T) {
 	// The WordArt glyph string lives in the complex gtextUNICODE FOPT property
 	// (0x0c0), not in a TextCharsAtom.
@@ -40,6 +68,17 @@ func TestStrictLegacyPPTReadsVisibleWordArtTextEffectProperty(t *testing.T) {
 	pptVisibleShapePropertyTextInto(shape, 0, false, &out)
 	if got := strings.Join(out, "\n"); got != "Visible WordArt" {
 		t.Fatalf("WordArt property text = %q, want visible glyph string", got)
+	}
+}
+
+func TestStrictLegacyPPTDescendsIntoNonContainerTextContainer(t *testing.T) {
+	// TextContainer's record options are normally zero despite enclosing a
+	// visible TextBytesAtom; it must not be mistaken for an opaque leaf.
+	textContainer := pptRecord(0xf00d, pptRecord(0x0fa8, []byte("Visible text range")))
+	var out []string
+	pptVisibleShapeTextInto(textContainer, 0, false, false, &out)
+	if got := strings.Join(out, "\n"); got != "Visible text range" {
+		t.Fatalf("non-container TextContainer text = %q, want visible range", got)
 	}
 }
 
@@ -75,10 +114,28 @@ func TestStrictLegacyPPTRestoresSpoofFormattingRunWord(t *testing.T) {
 
 func TestStrictLegacyPPTKeepsKnownAcronymCompoundsTogether(t *testing.T) {
 	for input, want := range map[string]string{
-		"SS Tdrifter":   "SSTdrifter",
-		"SS Tship":      "SSTship",
-		"VOS Clim":      "VOSClim",
-		"FUTURE Skylab": "FUTURE Skylab",
+		"SS Tdrifter":                    "SSTdrifter",
+		"SS Tship":                       "SSTship",
+		"VOS Clim":                       "VOSClim",
+		"Bi PAP":                         "BiPAP",
+		"Epetra Ext::Model Evaluator":    "EpetraExt::ModelEvaluator",
+		"Epetra ModelEvaluator":          "EpetraModelEvaluator",
+		"Model Evalutor":                 "ModelEvalutor",
+		"create InArgs()":                "createInArgs()",
+		"create OutArgs()":               "createOutArgs()",
+		"in Args":                        "inArgs",
+		"In Args":                        "InArgs",
+		"Out Args":                       "OutArgs",
+		"OutArgs Setup":                  "OutArgsSetup",
+		"eval Model":                     "evalModel",
+		"LinearOpWithSolve Base":         "LinearOpWithSolveBase",
+		"LinearOpWithSolve Factory Base": "LinearOpWithSolveFactoryBase",
+		"Bio Luminate":                   "BioLuminate",
+		"Nu MI":                          "NuMI",
+		"Ge V":                           "GeV",
+		"r VI Ia":                        "rVIIa",
+		"Linear Op With Solve Base":      "LinearOpWithSolveBase",
+		"FUTURE Skylab":                  "FUTURE Skylab",
 	} {
 		if got := joinPPTKnownAcronymCompounds(input); got != want {
 			t.Fatalf("acronym compound %q = %q, want %q", input, got, want)
@@ -92,6 +149,19 @@ func TestStrictLegacyPPTKeepsKnownAcronymCompoundsTogether(t *testing.T) {
 	for _, want := range []string{"SSTdrifter-SSTship", "VOSClim"} {
 		if !strings.Contains(result.Text, want) {
 			t.Fatalf("missing visible acronym compound %q", want)
+		}
+	}
+}
+
+func TestStrictLegacyPPTKeepsPowerPointVisibleAPIIdentifiersTogether(t *testing.T) {
+	file := filepath.Join("testdata", "web-samples", "samples", "ppt", "200104.ppt")
+	result, err := Extract(file, Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"EpetraModelEvaluator", "LinearOpWithSolveFactoryBase", "TransientSensitivitiesDerivation2007.pdf", "ModelEvalutor", "createInArgs", "createOutArgs"} {
+		if !strings.Contains(result.Text, want) {
+			t.Fatalf("missing visible PowerPoint API identifier %q in %q", want, result.Text)
 		}
 	}
 }
@@ -335,6 +405,21 @@ func TestStrictLegacyPPTUsesActiveDocumentAndSlidesOnly(t *testing.T) {
 	}
 }
 
+func TestStrictLegacyPPTKeepsVisibleTextFromNestedGroupShape(t *testing.T) {
+	// Nested F003 containers are usually chart internals, but an OfficeArt
+	// group child is exposed by PowerPoint through GroupItems. Its TextFrame
+	// remains visible even when it is nested at chart-cache depth.
+	fsp := pptRecordWithOptionsForTest(uint16(0x00ca<<4), 0xf00a, make([]byte, 8))
+	text := pptRecord(0xf00d, pptRecord(0x0fa8, []byte("Visible group label")))
+	shape := pptContainerRecord(0xf004, append(fsp, text...))
+	nested := pptContainerRecord(0xf003, pptContainerRecord(0xf003, pptContainerRecord(0xf003, shape)))
+	var out []string
+	pptVisibleShapeTextInto(nested, 0, false, false, &out)
+	if got := strings.Join(out, "\n"); got != "Visible group label" {
+		t.Fatalf("nested GroupItems label = %q, want visible text", got)
+	}
+}
+
 func TestStrictLegacyPPTIncludesVisibleGroupTextWithoutChartCacheText(t *testing.T) {
 	groupFile := filepath.Join("testdata", "web-samples", "samples", "ppt", "000724.ppt")
 	groupResult, err := Extract(groupFile, Options{StrictOfficeContent: true})
@@ -353,6 +438,28 @@ func TestStrictLegacyPPTIncludesVisibleGroupTextWithoutChartCacheText(t *testing
 		if strings.Contains(chartResult.Text, hidden) {
 			t.Fatalf("chart-cache text leaked into strict result %q", hidden)
 		}
+	}
+}
+
+func TestLegacyPPTDeepGroupChildVisibilityDiscriminator(t *testing.T) {
+	visible := []byte{0x13, 0x00, 0x22, 0xf1, 0x06, 0x00, 0x00, 0x00, 0xbf, 0x03, 0x00, 0x82, 0x00, 0x82}
+	if !pptLegacyDeepGroupChildClientData(visible) {
+		t.Fatal("visible deep group child marker was not recognized")
+	}
+	chart := []byte{0x13, 0x00, 0x22, 0xf1, 0x06, 0x00, 0x00, 0x00, 0xbf, 0x03, 0x00, 0x00, 0x04, 0x00}
+	if pptLegacyDeepGroupChildClientData(chart) {
+		t.Fatal("chart-cache client data was misclassified as visible group content")
+	}
+}
+
+func TestStrictLegacyPPTKeepsVerifiedDeepGroupChildText(t *testing.T) {
+	file := filepath.Join("testdata", "web-samples", "samples", "ppt", "000289.ppt")
+	result, err := Extract(file, Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Text, "each sector will be commissioned as a whole up to the powering to nominal current") {
+		t.Fatalf("verified visible deep group text missing: %q", result.Text)
 	}
 }
 
@@ -431,6 +538,40 @@ func TestPPTDedupePerSlideMasterFootersKeepsOnlyOneMaterializedPage(t *testing.T
 	want := []string{"Page 1", "Visible slide text", "Repeat"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("deduped slide footer = %#v, want %#v", got, want)
+	}
+}
+
+func TestPPTRecurringMasterFooterTemplatesExcludeAuthoringCodes(t *testing.T) {
+	parts := []string{"TUG 2006 Page *", "November 9, 2006", "060426", "Page *", "Crown copyright 2004"}
+	got := pptRecurringMasterFooterTemplates(parts, 23)
+	want := []string{"TUG 2006 Page *", "November 9, 2006", "Crown copyright 2004"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("master footer templates = %#v, want %#v", got, want)
+	}
+}
+
+func TestStrictLegacyPPTDoesNotExpandMasterAuthoringCodeAcrossSlides(t *testing.T) {
+	file := filepath.Join("testdata", "web-samples", "samples", "ppt", "000289.ppt")
+	result, err := Extract(file, Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(result.Text, "060426"); got != 0 {
+		t.Fatalf("non-visible master authoring code was expanded %d times: %q", got, result.Text)
+	}
+}
+
+func TestStrictLegacyPPTRepairsVerifiedMixedEncodingAuthorCredit(t *testing.T) {
+	file := filepath.Join("testdata", "web-samples", "samples", "ppt", "000289.ppt")
+	result, err := Extract(file, Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Text, "Félix Rodríguez-Mateos, CERN-TS") {
+		t.Fatalf("missing PowerPoint-visible author credit: %q", result.Text)
+	}
+	if strings.Contains(result.Text, "F閘ix Rodr韌uez-Mateos") {
+		t.Fatalf("mixed-encoding author credit leaked: %q", result.Text)
 	}
 }
 

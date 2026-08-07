@@ -7,8 +7,8 @@ import (
 )
 
 func TestMarkdownImageReferenceCount(t *testing.T) {
-	markdown := "plain ![first](images/one.png) text ![broken] and ![second](images/two.png)"
-	if got, want := markdownImageReferenceCount(markdown), 2; got != want {
+	markdown := "plain ![first](images/one.png) text ![broken] and ![asset\\[1\\]](images/one\\)copy.png) and ![second](images/two.png)"
+	if got, want := markdownImageReferenceCount(markdown), 3; got != want {
 		t.Fatalf("markdownImageReferenceCount() = %d, want %d", got, want)
 	}
 }
@@ -32,5 +32,22 @@ func TestCheckFilesPreservesInputOrder(t *testing.T) {
 		if result.Path != paths[i] {
 			t.Errorf("result %d path = %q, want %q", i, result.Path, paths[i])
 		}
+	}
+}
+
+func TestProgressWriterRecordsFinalPartialBatch(t *testing.T) {
+	dir := t.TempDir()
+	p := &progressWriter{
+		jsonPath: filepath.Join(dir, "report.json"),
+		csvPath:  filepath.Join(dir, "report.csv"),
+		report:   &Report{Summary: map[string]ExtSummary{}},
+		results:  make([]FileResult, 3),
+		done:     make([]bool, 3),
+	}
+	for i := range p.results {
+		p.record(i, FileResult{Path: filepath.Join(dir, "sample"), Ext: ".pptx", OK: true})
+	}
+	if _, err := os.Stat(p.jsonPath); err != nil {
+		t.Fatalf("final partial checkpoint was not written: %v", err)
 	}
 }

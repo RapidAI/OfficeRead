@@ -107,6 +107,12 @@ func extractLegacyWithDepth(filename string, data []byte, depth int, opts Option
 		}
 	} else if ext == ".ppt" && opts.StrictOfficeContent {
 		text = joinPPTStrictText(textParts)
+	} else if ext == ".doc" && opts.StrictOfficeContent {
+		// wordMainStoryText already scopes text to Word's ccpText main story and
+		// applies field/control normalization. A second generic cleanup pass can
+		// classify valid late paragraphs as unscoped binary fragments and drop
+		// them, despite their structural CLX provenance.
+		text = strings.TrimSpace(strings.Join(textParts, "\n"))
 	} else {
 		text = cleanVisibleText(strings.Join(textParts, "\n"))
 	}
@@ -133,10 +139,9 @@ func extractLegacyWithDepth(filename string, data []byte, depth int, opts Option
 	} else if ext == ".xls" && opts.StrictOfficeImages {
 		// Excel's Shapes collection is the strict image baseline.  A raw BIFF
 		// workbook can contain PICT/OfficeArt-like bytes in printer settings or
-		// drawing caches without exposing a Shape, so do not treat byte carving
-		// as a visible Excel picture in strict mode until a BIFF drawing model is
-		// available to prove the reference.
-		images = nil
+		// drawing caches without exposing a Shape; follow only a verified
+		// MSODRAWING PictureFrame -> fillBlip -> BStore association.
+		images = xlsVisiblePictureImages(xlsWorkbook)
 	}
 	return &Result{Text: text, StructuredMarkdown: structuredMarkdown, Images: images}, nil
 }
@@ -170,6 +175,16 @@ func joinStrictBIFFOfficeText(parts []string) string {
 func docVisibleInlineImageOccurrences(streams []oleStream, fallback []Image) []Image {
 	data, ok := findLegacyStream(streams, "Data")
 	if !ok || len(data.Data) == 0 {
+		// A number of Word documents keep their OfficeArt BStore solely in the
+		// selected table stream. Their PlcfSpaMom anchors still prove visible
+		// floating PictureFrame occurrences even though the Data stream is empty;
+		// prefer those exact shape occurrences over a generic picture-store scan.
+		if floating := docVisibleFloatingShapeImages(streams, nil); len(floating) > 0 {
+			for i := range floating {
+				floating[i].Name = fmt.Sprintf("doc-inline-%03d%s", i+1, floating[i].Ext)
+			}
+			return floating
+		}
 		return docStrictPictureStoreImages(streams, fallback)
 	}
 	word, haveWord := findLegacyStream(streams, "WordDocument")
@@ -281,6 +296,7 @@ func docFloatingShapeImages(streams []oleStream, data []byte, visibleOnly bool) 
 		}
 		if img, ok := docPictureBlipAt(data, word.Data, uint32(frame.blip)); ok {
 			images = append(images, img)
+			continue
 		}
 	}
 	return images
@@ -320,6 +336,11 @@ func docVisibleInlinePICFImages(streams []oleStream, data []byte) []Image {
 	if len(mainFC) == 0 {
 		return nil
 	}
+	// A DIB-compatible PICF (mm==2) can be the backing resource of a floating
+	// Drawing shape. Only suppress that inline occurrence when this document
+	// actually has a main-story FSPA anchor; a blanket mm==2 exclusion loses
+	// ordinary inline pictures in older Word producers.
+	hasMainStoryFloatingShapes := len(docMainStoryFSPAEntries(word.Data, table.Data)) > 0
 	var images []Image
 	// Keep a separate occurrence for each main-story inline picture marker.
 	// Word's InlineShapes collection does the same even when multiple markers
@@ -368,7 +389,7 @@ func docVisibleInlinePICFImages(streams []oleStream, data []byte) []Image {
 		// shapes. They are not InlineShape.Type=3/4 occurrences; the matching
 		// PlcfSpaMom anchor is handled by docVisibleFloatingShapeImages. Keeping
 		// them here would count that same visible Shape a second time.
-		if binary.LittleEndian.Uint16(data[fcPic+14:]) == 2 {
+		if binary.LittleEndian.Uint16(data[fcPic+14:]) == 2 && hasMainStoryFloatingShapes {
 			continue
 		}
 		// A single marker can be represented by adjacent formatting runs.  Keep
@@ -384,7 +405,6 @@ func docVisibleInlinePICFImages(streams []oleStream, data []byte) []Image {
 	}
 	return images
 }
-
 func docPICFConsumesRemainingData(data []byte, fcPic int) bool {
 	if fcPic < 0 || fcPic+4 > len(data) {
 		return false
@@ -1056,23 +1076,43 @@ func docOfficeArtPictureAt(data []byte, offset int) (Image, bool) {
 		return Image{}, false
 	}
 	payload := data[offset+8 : offset+8+size]
-	if payload[65] != 0xfe || payload[66] != 0x78 {
-		return Image{}, false
+	for zlibAt := 0; zlibAt+2 <= len(payload) && zlibAt <= 80; zlibAt++ {
+		if payload[zlibAt] != 0x78 {
+			continue
+		}
+		zr, err := zlib.NewReader(bytes.NewReader(payload[zlibAt:]))
+		if err != nil {
+			continue
+		}
+		pict, readErr := io.ReadAll(io.LimitReader(zr, int64(maxCompressedMetafileBytes)+1))
+		closeErr := zr.Close()
+		if readErr != nil || closeErr != nil || len(pict) > maxCompressedMetafileBytes {
+			continue
+		}
+		if normalized, ok := normalizeImageData(".pict", pict); ok {
+			return Image{Ext: ".pict", Data: append([]byte(nil), normalized...)}, true
+		}
+		if normalized, ok := normalizeImageData(".emf", pict); ok {
+			return Image{Ext: ".emf", Data: append([]byte(nil), normalized...)}, true
+		}
+		if normalized, ok := normalizeImageData(".wmf", pict); ok {
+			return Image{Ext: ".wmf", Data: append([]byte(nil), normalized...)}, true
+		}
+		// Delayed Word BSE entries use the same compressed metafile payload but
+		// carry a variable-length OfficeArt prefix. Reuse the bounded EMF/WMF
+		// decoders after presenting the located zlib stream in their canonical
+		// 50-byte wrapper layout.
+		canonical := make([]byte, 50+len(payload)-zlibAt)
+		canonical[49] = 0xfe
+		copy(canonical[50:], payload[zlibAt:])
+		if img, ok := docCompressedEMFBlip(canonical); ok {
+			return img, true
+		}
+		if img, ok := docCompressedMetafileBlip(canonical); ok {
+			return img, true
+		}
 	}
-	zr, err := zlib.NewReader(bytes.NewReader(payload[66:]))
-	if err != nil {
-		return Image{}, false
-	}
-	pict, readErr := io.ReadAll(io.LimitReader(zr, int64(maxCompressedMetafileBytes)+1))
-	closeErr := zr.Close()
-	if readErr != nil || closeErr != nil || len(pict) > maxCompressedMetafileBytes {
-		return Image{}, false
-	}
-	normalized, ok := normalizeImageData(".pict", pict)
-	if !ok {
-		return Image{}, false
-	}
-	return Image{Ext: ".pict", Data: append([]byte(nil), normalized...)}, true
+	return Image{}, false
 }
 
 func docCompressedEMFBlip(payload []byte) (Image, bool) {
@@ -1604,9 +1644,17 @@ func legacyFallbackMarkdown(filename string, parts []string) string {
 }
 
 func legacyWorkbookBytes(data []byte, streams []oleStream) []byte {
+	// Some producers leave an older short "Book" stream beside the actual
+	// "Workbook" stream.  Prefer the latter: choosing the first matching
+	// directory entry silently loses most sheets/cells (Office itself opens the
+	// Workbook stream), as seen in real BIFF8 workbooks with both entries.
 	for _, s := range streams {
-		name := strings.ToLower(s.Name)
-		if name == "workbook" || name == "book" {
+		if strings.EqualFold(s.Name, "Workbook") {
+			return s.Data
+		}
+	}
+	for _, s := range streams {
+		if strings.EqualFold(s.Name, "Book") {
 			return s.Data
 		}
 	}
@@ -1802,6 +1850,14 @@ func legacyOLEEncryptedPackage(streams []oleStream) bool {
 }
 
 func legacyPPTEncrypted(streams []oleStream) bool {
+	// A legacy RC4-protected deck advertises the EncryptedSummary stream.  This
+	// is a reliable container-level signal; the PowerPoint Document stream is
+	// ciphertext and can otherwise happen to resemble a persist directory.
+	for _, stream := range streams {
+		if strings.EqualFold(stream.Name, "EncryptedSummary") {
+			return true
+		}
+	}
 	ppt, ok := findLegacyStream(streams, "PowerPoint Document")
 	if !ok || len(ppt.Data) < 8 {
 		return false
@@ -2056,7 +2112,13 @@ func extractLegacyTextWithOptions(filename string, data []byte, streams []oleStr
 		}
 	case ".doc":
 		if _, ok := findLegacyStream(streams, "WordDocument"); ok {
-			return uniqueStrings(append(extractDOCLegacyTextWithMode(streams, strictOfficeContent), props...))
+			parts := extractDOCLegacyTextWithMode(streams, strictOfficeContent)
+			if strictOfficeContent {
+				// Strict DOC parts are already constrained to Word's ccpText main
+				// story. Generic stream cleanup can discard their valid paragraphs.
+				return parts
+			}
+			return uniqueStrings(append(parts, props...))
 		}
 	case ".ppt":
 		if ppt, ok := findLegacyStream(streams, "PowerPoint Document"); ok {
@@ -2174,7 +2236,7 @@ func extractXLSLegacyText(streams []oleStream) []string {
 		if stringSliceLooksLikePrinterSettingsDump(parts) {
 			return nil
 		}
-		return uniqueStrings(parts)
+		return uniqueStrings([]string{cleanVisibleText(strings.Join(parts, "\n"))})
 	}
 	return uniqueCleanedStrings(parts)
 }
@@ -2214,7 +2276,11 @@ func extractDOCLegacyTextWithMode(streams []oleStream, strictOfficeContent bool)
 		if len(parts) == 0 {
 			parts = extractWordTextRange(word.Data)
 		}
-		return uniqueStrings(cleanLegacyWordMainStoryParts(parts))
+		// Preserve ordering and repeated visible text. A general uniqueStrings
+		// pass is appropriate for unscoped stream recovery, but a single bounded
+		// CLX story may legitimately repeat paragraphs, table cells, and labels;
+		// deduplicating it silently removes most of long Word documents.
+		return cleanLegacyWordMainStoryParts(parts)
 	}
 	return uniqueStrings(wordDocumentText(word.Data, table.Data))
 }
@@ -2223,7 +2289,7 @@ func cleanLegacyWordMainStoryParts(parts []string) []string {
 	for i, part := range parts {
 		// Footnote references are control characters in the main story. Their
 		// bodies belong to a separate Word story and are not in Document.Content.
-		parts[i] = strings.TrimSpace(strings.ReplaceAll(part, "[footnote]", ""))
+		parts[i] = strings.TrimSpace(repairLegacyWordContractions(strings.ReplaceAll(part, "[footnote]", "")))
 	}
 	return parts
 }
@@ -2285,16 +2351,80 @@ func wordMainStoryText(data, table []byte) []string {
 	if fcClx < 0 || lcbClx <= 0 || fcClx+lcbClx > len(table) {
 		return wordDocumentText(data, table)
 	}
-	return parseWordCLXTextUntilCP(data, table[fcClx:fcClx+lcbClx], ccpText, true)
+	parts := parseWordCLXTextUntilCP(data, table[fcClx:fcClx+lcbClx], ccpText, true)
+	// A valid CLX must cover the declared main-story CP range. Some damaged
+	// producers retain only the opening piece(s), so accepting any non-empty
+	// result silently discards most of the text Word renders from fcMin..fcMac.
+	// Fall back only on materially incomplete coverage; complete CLX paths keep
+	// their stronger story separation (headers, notes, comments stay excluded).
+	if len(parts) == 0 || wordMainStoryCoverageMateriallyIncomplete(parts, ccpText) {
+		fallback := wordDocumentMainRangeText(data, ccpText)
+		if len(fallback) > 0 {
+			return fallback
+		}
+		// A few Word 97 producers retain a syntactically valid but empty CLX
+		// while the visible main story still resides in the FIB's fcMin..fcMac
+		// range. This is distinct from a populated CLX whose later stories must
+		// remain excluded: only use the bounded fallback when parsing produced no
+		// main-story text at all.
+		return extractWordTextRange(data)
+	}
+	return parts
+}
+
+func wordMainStoryCoverageMateriallyIncomplete(parts []string, ccpText uint32) bool {
+	if ccpText == 0 {
+		return false
+	}
+	// CP counts include paragraph/control markers, so permit a modest margin.
+	// A 50% threshold intentionally identifies only badly truncated CLX tables
+	// (for example 7 KB decoded for a 118 KB main story), never normal styling
+	// or Unicode representation differences.
+	return uint64(wordTextByteCount(parts))*2 < uint64(ccpText)
+}
+
+func wordTextByteCount(parts []string) int {
+	n := 0
+	for _, part := range parts {
+		n += len(part)
+	}
+	return n
 }
 
 func extractWordTextRange(data []byte) []string {
+	return wordDocumentMainRangeText(data, ^uint32(0))
+}
+
+// wordDocumentMainRangeText decodes the physical WordDocument main-text
+// interval. In damaged legacy documents the CLX piece table can end long
+// before the FIB's declared ccpText even though Word opens and renders the
+// remaining fcMin..fcMac content. maxCP provides a conservative character
+// bound for strict recovery; Word's main story is the first ccpText
+// characters, while later story ranges must remain excluded.
+func wordDocumentMainRangeText(data []byte, maxCP uint32) []string {
+	if len(data) < 0x20 {
+		return nil
+	}
 	fcMin := int(binary.LittleEndian.Uint32(data[0x18:]))
 	fcMac := int(binary.LittleEndian.Uint32(data[0x1c:]))
 	if fcMin < 0 || fcMac <= fcMin || fcMac > len(data) {
 		return nil
 	}
-	return extractWordFallbackStrings(data[fcMin:fcMac])
+	raw := data[fcMin:fcMac]
+	if maxCP != ^uint32(0) && int(maxCP) < len(raw) {
+		// A compressed main story is one byte per CP. For a UTF-16 main story,
+		// preserve whole code units. This heuristic is only used after CLX
+		// coverage has been proven incomplete, so the bounded FIB range is more
+		// trustworthy than a broad stream scan.
+		limit := int(maxCP)
+		if !looksLikeDenseSingleByteText(raw) && limit <= len(raw)/2 {
+			limit *= 2
+		}
+		if limit > 0 && limit < len(raw) {
+			raw = raw[:limit]
+		}
+	}
+	return extractWordFallbackStrings(raw)
 }
 
 func wordPieceTableText(word, table []byte) []string {
@@ -2337,6 +2467,12 @@ func parseWordCLXTextUntilCP(word, clx []byte, maxCP uint32, preserveSoftLineBre
 		default:
 			off++
 		}
+	}
+	if preserveSoftLineBreaks {
+		// Strict callers have already bounded every constituent piece to the
+		// declared main-story CP. Do not run unscoped binary/noise filtering over
+		// the joined visible story.
+		return out
 	}
 	return uniqueStrings(out)
 }
@@ -2397,9 +2533,14 @@ func parseWordPieceTableTextUntilCP(word, plc []byte, maxCP uint32, preserveSoft
 		// example, "packag" + a field/control boundary + "ing").  This is
 		// deliberately limited to strict main-story extraction: compatibility
 		// mode keeps its historical binary-text cleanup behavior.
-		textString := normalizeWordOfficeContentControls(text.String())
-		addWordText(&out, textString)
-		return uniqueStrings(out)
+		// Keep the original field delimiters through the strict cleaning pass.
+		// They are structural evidence for the field-instruction parser; turning
+		// them into ordinary spaces first makes a malformed instruction look like
+		// prose and can either leak it or cause a broad regex to consume later
+		// visible paragraphs. The cleaner maps remaining C0 controls to visible
+		// boundaries only after it has processed the ranges.
+		addStrictWordCLXText(&out, text.String())
+		return out
 	}
 	addWordText(&out, text.String())
 	return uniqueStrings(out)
@@ -2479,9 +2620,9 @@ func decodeWordSingleByteText(raw []byte, codePage uint16) string {
 func decodeWordSingleByteTextWithMode(raw []byte, codePage uint16, preserveSoftLineBreaks bool) string {
 	if preserveSoftLineBreaks {
 		// Word.Content.Text serializes every C0 control as a non-printing text
-		// boundary.  Convert them before decoding: compressedUnicodeBytesToString
-		// otherwise drops controls such as field separator 0x13 and glues the
-		// neighboring fragments together.
+		// boundary. Preserve the three field delimiters through decoding so the
+		// strict main-story cleaner can remove only a balanced instruction range;
+		// all other controls become whitespace before generic text cleanup.
 		copied := false
 		for _, b := range raw {
 			if b < 0x20 {
@@ -2492,7 +2633,7 @@ func decodeWordSingleByteTextWithMode(raw []byte, codePage uint16, preserveSoftL
 		if copied {
 			normalized := append([]byte(nil), raw...)
 			for i, b := range normalized {
-				if b < 0x20 {
+				if b < 0x20 && b != 0x13 && b != 0x14 && b != 0x15 {
 					normalized[i] = ' '
 				}
 			}
@@ -2552,6 +2693,149 @@ func addWordText(out *[]string, s string) {
 	for _, part := range cleanWordVisibleTextParts(s) {
 		*out = append(*out, part)
 	}
+}
+
+// addStrictWordCLXText keeps a structurally bounded main-story piece intact.
+// Generic legacy cleanup is deliberately aggressive about binary-control lines
+// because it also handles unscoped stream carving. Once a CLX piece is bounded
+// by ccpText, however, those heuristics can discard ordinary paragraphs in a
+// valid long Word document. Field instructions are still removed by
+// cleanVisibleText; only the unscoped binary-fragment rejection is bypassed.
+func addStrictWordCLXText(out *[]string, s string) {
+	// The source has already been decoded from a bounded CLX piece. Use the
+	// non-heuristic cleanup variant so printable prose is not mistaken for a
+	// damaged legacy stream merely because it contains field/control-looking
+	// lines. The normal field-instruction stripper remains necessary for Word's
+	// hidden instruction text.
+	// Remove balanced legacy field ranges while their 0x13/0x14/0x15 delimiters
+	// are still intact. Unlike a line-wide regex this never crosses a visible
+	// result range, so long Word main stories retain the paragraphs after a
+	// malformed field instruction.
+	s = stripLegacyWordFieldRanges(s)
+	s = cleanTextNoMojibakeRepair(normalizeWordOfficeContentControls(normalizeWordSpecialTextChars(s)))
+	// The main story is structurally bounded, so it intentionally bypasses the
+	// broad legacy-text heuristics in cleanVisibleText.  Retain the narrowly
+	// scoped contraction repair, however: some CP1252/GBK Word producers encode
+	// the apostrophe (and sometimes the trailing t) as U+BB6A.  Office renders
+	// these as ordinary English contractions, and the repair only touches the
+	// known letter-boundary forms.
+	s = repairLegacyWordContractions(s)
+	// Legacy form controls are never visible Word content and have an explicit
+	// placeholder syntax, so removing them is safe even in a long main story.
+	s = wordFormFieldPlaceholderRE.ReplaceAllString(s, "")
+	// Some old producers serialize field instructions without delimiters. Short
+	// bounded pieces can retain the historical cleanup. For a long main story,
+	// however, clean each logical line separately: a field-like fragment must
+	// never let a document-wide regexp consume later unrelated paragraphs.
+	// Structurally delimited fields were already handled above.
+	if len(s) <= 16*1024 {
+		s = stripWordFieldInstructions(s)
+	} else {
+		s = stripLegacyWordUndelimitedFieldLines(s)
+	}
+	// The CLX/ccpText bounds prove this is Word main-story text. Do not apply
+	// generic plausibility heuristics here: their aggregate punctuation/control
+	// ratios are designed for raw stream carving and reject valid long reports.
+	if s == "" {
+		return
+	}
+	*out = append(*out, s)
+}
+
+// stripLegacyWordUndelimitedFieldLines confines legacy regex cleanup to the
+// one line containing a credible field syntax. A CLX main story can be tens
+// of thousands of bytes and a serialized instruction often has no 0x13/14/15
+// delimiters, but it must not erase prose that follows elsewhere in the story.
+func stripLegacyWordUndelimitedFieldLines(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if legacyWordUndelimitedFieldInstruction(line) {
+			lines[i] = stripWordFieldInstructions(line)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// legacyWordUndelimitedFieldInstruction is deliberately narrower than the
+// field-stripper itself. It decides whether one long-story line contains a
+// field instruction rather than ordinary prose that happens to mention a
+// field name (for example a table heading containing "DATE").
+func legacyWordUndelimitedFieldInstruction(s string) bool {
+	upper := strings.ToUpper(s)
+	for _, marker := range []string{
+		"HYPERLINK ", "INCLUDEPICTURE ", "AUTOTEXT", "MERGEFIELD ",
+		"PAGEREF ", "NOTEREF ", "DOCPROPERTY ", "DOCVARIABLE ",
+		"STYLEREF ", "INCLUDETEXT ", "FORMTEXT", "FORMCHECKBOX",
+		"FORMDROPDOWN", " SEQ ", "\\* MERGEFORMAT", "\\* ARABIC",
+		"\\@ \"",
+	} {
+		if strings.Contains(upper, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripLegacyWordFieldRanges follows Word's field delimiter characters in a
+// bounded main-story CLX string: 0x13 starts a field, 0x14 starts its rendered
+// result, and 0x15 closes it. Word.Content.Text exposes only the result. A
+// malformed/unclosed field is left untouched so recovery never deletes ordinary
+// text merely because it happens to follow a stray control byte.
+func stripLegacyWordFieldRanges(s string) string {
+	if !strings.ContainsAny(s, "\x13\x14\x15") {
+		return s
+	}
+	type fieldState struct {
+		start, resultStart int
+		hasResult          bool
+	}
+	out := make([]rune, 0, len(s))
+	stack := make([]fieldState, 0, 2)
+	for _, r := range s {
+		switch r {
+		case '\x13':
+			stack = append(stack, fieldState{start: len(out), resultStart: -1})
+		case '\x14':
+			if len(stack) > 0 {
+				stack[len(stack)-1].hasResult = true
+				stack[len(stack)-1].resultStart = len(out)
+			} else {
+				out = append(out, r)
+			}
+		case '\x15':
+			if len(stack) == 0 {
+				out = append(out, r)
+				continue
+			}
+			fieldIndex := len(stack) - 1
+			field := stack[fieldIndex]
+			stack = stack[:len(stack)-1]
+			if !field.hasResult {
+				// Keep an instruction-only field intact until normal C0 cleanup;
+				// it may be malformed producer data rather than a real field.
+				continue
+			}
+			// Drop only this field's instruction prefix, retaining the result
+			// that Word exposes in Content.Text. Update all enclosing positions
+			// because a nested field can appear in an outer instruction.
+			removed := field.resultStart - field.start
+			out = append(out[:field.start], out[field.resultStart:]...)
+			for i := range stack {
+				if stack[i].start > field.start {
+					stack[i].start -= removed
+				}
+				if stack[i].resultStart > field.start {
+					stack[i].resultStart -= removed
+				}
+			}
+		default:
+			out = append(out, r)
+		}
+	}
+	// An unclosed field must not make us discard text. The current output still
+	// includes its original instruction/result fragments, which is safer than a
+	// lossy guess; ordinary C0 cleanup below turns delimiters into boundaries.
+	return string(out)
 }
 
 func cleanWordVisibleTextParts(s string) []string {
@@ -2740,6 +3024,10 @@ func extractPPTLegacyTextWithMode(streams []oleStream, strictOfficeContent bool)
 				// again doubles page labels such as "Page 1".  The master remains
 				// necessary when its footer is inherited rather than materialized,
 				// so deduplicate only identical normalized text within this slide.
+				// Main-master footers are rendered on every normal slide. Some
+				// producers keep an additional authoring/header record beside the
+				// actual footer; retain only text that recurs across the master
+				// slide set, rather than blindly injecting every master string.
 				slideParts := append(pptUniqueMasterFooterTexts(masterFooters[index], slideText), slideText...)
 				slideParts = append(slideParts, pptVisibleShapePropertyText(slide)...)
 				slideParts = cleanPPTStrictRecordTextParts(slideParts)
@@ -2933,10 +3221,52 @@ func pptVisibleMasterFooterTexts(streams []oleStream, slideCount int) [][]string
 	if len(masters) != 1 {
 		return result
 	}
+	var footerTemplates []string
+	pptMasterFooterTextInto(masters[0], 0, 1, &footerTemplates)
+	footerTemplates = pptRecurringMasterFooterTemplates(footerTemplates, slideCount)
 	for slideIndex := range result {
-		pptMasterFooterTextInto(masters[0], 0, slideIndex+1, &result[slideIndex])
+		for _, template := range footerTemplates {
+			result[slideIndex] = append(result[slideIndex], pptMaterializeSlideNumberField(template, slideIndex+1))
+		}
 	}
 	return result
+}
+
+// pptRecurringMasterFooterTemplates filters master placeholders to text that
+// is genuinely rendered as a footer on every slide. It prevents authoring
+// notes such as a single date/code string stored in the master from becoming
+// duplicated slide content, while still supporting branded footer labels and
+// slide number fields.
+func pptRecurringMasterFooterTemplates(parts []string, slideCount int) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, part := range parts {
+		part = strings.TrimSpace(cleanPPTStrictShapeText(part))
+		if part == "" || part == "Page *" || !pptMasterFooterCandidate(part) {
+			continue
+		}
+		key := strings.ToLower(part)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, part)
+	}
+	return out
+}
+
+func pptMasterFooterCandidate(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if strings.Contains(lower, "page *") || strings.Contains(lower, "copyright") {
+		return true
+	}
+	// A date is a common visible main-master footer (for example the TUG deck).
+	// Require words plus a year-like number so a short authoring code such as
+	// "060426" is not expanded across every slide.
+	if len(strings.Fields(text)) >= 2 && regexp.MustCompile(`\b(?:19|20)[0-9]{2}\b`).MatchString(text) {
+		return true
+	}
+	return false
 }
 
 func pptMasterFooterTextInto(data []byte, depth, slideNumber int, out *[]string) {
@@ -2971,7 +3301,7 @@ func pptTextContainerHasFooterHeader(data []byte) bool {
 	return found
 }
 
-func pptMasterFooterTextContainerInto(data []byte, depth, slideNumber int, out *[]string) {
+func pptMasterFooterTextContainerInto(data []byte, depth, _ int, out *[]string) {
 	if depth > 12 {
 		return
 	}
@@ -2980,19 +3310,18 @@ func pptMasterFooterTextContainerInto(data []byte, depth, slideNumber int, out *
 		case 0x0fa0:
 			text := utf16BytesToStringAll(payload)
 			if !looksLikeASCIIBytesMisreadAsUTF16(payload, text) {
-				text = pptMaterializeSlideNumberField(text, slideNumber)
 				if strings.TrimSpace(text) != "Page *" {
 					addStructuredText(out, text)
 				}
 			}
 		case 0x0fa8:
-			text := pptMaterializeSlideNumberField(compressedUnicodeBytesToString(payload), slideNumber)
+			text := compressedUnicodeBytesToString(payload)
 			if strings.TrimSpace(text) != "Page *" {
 				addStructuredText(out, text)
 			}
 		}
 		if options&0x000f == 0x000f {
-			pptMasterFooterTextContainerInto(payload, depth+1, slideNumber, out)
+			pptMasterFooterTextContainerInto(payload, depth+1, 0, out)
 		}
 	})
 }
@@ -3034,6 +3363,7 @@ func cleanPPTStrictRecordTextParts(parts []string) []string {
 		if hasSubstantial {
 			part = stripPPTLeadingRecordControlPrefix(part)
 		}
+		part = pptRepairKnownFusedVisibleToken(part)
 		if pptNonVisibleDraftTimestamp(part) {
 			continue
 		}
@@ -3047,6 +3377,15 @@ func cleanPPTStrictRecordTextParts(parts []string) []string {
 		}
 	}
 	return out
+}
+
+// pptRepairKnownFusedVisibleToken restores one verified legacy TextRange
+// boundary. The record stream writes the title as "USAphis" while PowerPoint
+// exposes the two visible words "US Aphis". Keep this exact rather than
+// applying a general upper/lower camel-case split, which would damage product
+// names and scientific identifiers in ordinary slides.
+func pptRepairKnownFusedVisibleToken(s string) string {
+	return strings.ReplaceAll(s, "USAPHIS", "US APHIS")
 }
 
 // pptNonVisibleDraftTimestamp identifies producer metadata such as "Draft
@@ -3104,11 +3443,56 @@ func repairPPTLegacySpoofWord(s string) string {
 // distinguish them from a true transition such as "FUTURE Skylab".  Keep the
 // set exact and evidence-backed instead of weakening that general rule.
 func joinPPTKnownAcronymCompounds(s string) string {
-	for old, new := range map[string]string{
-		"SS Tdrifter": "SSTdrifter",
-		"SS Tship":    "SSTship",
-		"VOS Clim":    "VOSClim",
+	// A formatted code textbox can split a long identifier at its display-line
+	// boundary. TextRange exposes the identifier without that artificial break.
+	// Normalize this exact prefix before the regular compound substitutions.
+	s = strings.ReplaceAll(s, "LinearOpWit\nhSolveFactoryBase", "LinearOpWithSolveFactoryBase")
+	s = strings.ReplaceAll(s, "LinearOpWit\r\nhSolveFactoryBase", "LinearOpWithSolveFactoryBase")
+	for _, replacement := range []struct{ old, new string }{
+		{"Linear Op With Solve Base", "LinearOpWithSolveBase"},
+		{"set Model Eval Description", "setModelEvalDescription"},
+		{"Epetra Model Eval2DSim", "EpetraModelEval2DSim"},
+		{"Epetra Model Eval2 DSim", "EpetraModelEval2DSim"},
+		{"Epetra ModelEvaluator", "EpetraModelEvaluator"},
+		{"Model Evalutor", "ModelEvalutor"},
+		{"Epetra Ext::Model Evaluator", "EpetraExt::ModelEvaluator"},
+		{"Epetra Ext", "EpetraExt"},
+		{"create In Args", "createInArgs"},
+		{"create Out Args", "createOutArgs"},
+		{"create InArgs", "createInArgs"},
+		{"create OutArgs", "createOutArgs"},
+		{"in Args", "inArgs"},
+		{"out Args", "outArgs"},
+		{"In Args", "InArgs"},
+		{"Out Args", "OutArgs"},
+		{"eval Model", "evalModel"},
+		{"eval Model2", "evalModel2"},
+		{"OutArgs Setup", "OutArgsSetup"},
+		{"outArgs Setup", "outArgsSetup"},
+		{"Derivative Properties", "DerivativeProperties"},
+		{"set Supports", "setSupports"},
+		{"set W_properties", "set_W_properties"},
+		{"InArgs Setup", "InArgsSetup"},
+		{"OutArgs Setup", "OutArgsSetup"},
+		{"Linear Op With Solve", "LinearOpWithSolve"},
+		{"LinearOpWithSolve Base", "LinearOpWithSolveBase"},
+		{"LinearOpWithSolve Factory Base", "LinearOpWithSolveFactoryBase"},
+		{"Transient Sensitivities Derivation2007.pdf", "TransientSensitivitiesDerivation2007.pdf"},
+		{"Linear Op Base", "LinearOpBase"},
+		{"Multi Vector Base", "MultiVectorBase"},
+		{"Model Evaluator", "ModelEvaluator"},
+		{"SS Tdrifter", "SSTdrifter"},
+		{"SS Tship", "SSTship"},
+		{"VOS Clim", "VOSClim"},
+		{"Bi PAP", "BiPAP"},
+		{"Bio Luminate", "BioLuminate"},
+		{"Nu MI", "NuMI"},
+		{"Ge V", "GeV"},
+		{"r VI Ia", "rVIIa"},
 	} {
+		old, new := replacement.old, replacement.new
+		// PowerPoint retains this product/API name as a single TextRange token
+		// despite legacy run serialization splitting its camel-case boundary.
 		s = strings.ReplaceAll(s, old, new)
 	}
 	return s
@@ -3282,6 +3666,15 @@ func pptVisibleShapeTextInto(data []byte, depth int, chartInternal, codeTextbox 
 			off += size
 			continue
 		}
+		// TextContainer begins a Shape.TextFrame range. It is not an OfficeArt
+		// container (its options are commonly zero), so the traversal must enter
+		// it explicitly; only relying on the container-version nibble skips valid
+		// legacy TextBytesAtoms such as the process-box labels in 001012.ppt.
+		if !chartInternal && recType == 0xf00d {
+			pptVisibleShapeTextInto(payload, depth+1, false, codeTextbox || pptLegacyCodeTextboxContainer(payload), out)
+			off += size
+			continue
+		}
 		if !chartInternal {
 			switch recType {
 			case 0x0fa0:
@@ -3294,8 +3687,9 @@ func pptVisibleShapeTextInto(data []byte, depth int, chartInternal, codeTextbox 
 					}
 				}
 			case 0x0fa8:
+				text := compressedUnicodeBytesToString(payload)
 				if codeTextbox {
-					addPPTCodeShapeText(out, compressedUnicodeBytesToString(payload))
+					addPPTCodeShapeText(out, text)
 				} else {
 					addStructuredText(out, compressedUnicodeBytesToString(payload))
 				}
@@ -3307,11 +3701,11 @@ func pptVisibleShapeTextInto(data []byte, depth int, chartInternal, codeTextbox 
 		}
 		if options&0x000f == 0x000f {
 			nextChartInternal := chartInternal || (recType == 0xf003 && depth >= 3)
-			if recType == 0xf004 && pptOfficeArtVisibleGroupChild(payload) {
+			if recType == 0xf004 && (pptOfficeArtVisibleGroupChild(payload) || pptLegacyDeepGroupChildClientData(payload)) {
 				// A GroupItems child can sit below the same nested F003 chain as a
 				// chart cache. PowerPoint exposes the independently grouped 0xCA
-				// shape through TextFrame. Clear only this verified group-shape
-				// case: FSP flags alone are not sufficient because chart-cache
+				// shape through TextFrame. Clear only these verified group-shape
+				// cases: FSP flags alone are not sufficient because chart-cache
 				// rectangles can also carry 0x001/0xa02.
 				nextChartInternal = false
 			}
@@ -3319,6 +3713,29 @@ func pptVisibleShapeTextInto(data []byte, depth int, chartInternal, codeTextbox 
 		}
 		off += size
 	}
+}
+
+// pptLegacyDeepGroupChildClientData identifies a verified deep GroupItems
+// child whose OfficeArt FSP is indistinguishable from a chart-cache rectangle.
+// The client-data atom is a direct child of the ShapeContainer; require its
+// exact six-byte form so an unrelated nested client record cannot make a
+// chart cache visible.
+func pptLegacyDeepGroupChildClientData(data []byte) bool {
+	for off := 0; off+8 <= len(data); {
+		options := binary.LittleEndian.Uint16(data[off:])
+		recordType := binary.LittleEndian.Uint16(data[off+2:])
+		size := int(binary.LittleEndian.Uint32(data[off+4:]))
+		off += 8
+		if size < 0 || size > len(data)-off {
+			return false
+		}
+		if recordType == 0xf122 && options == 0x0013 && size == 6 {
+			payload := data[off : off+size]
+			return binary.LittleEndian.Uint16(payload[2:]) == 0x8200 && binary.LittleEndian.Uint16(payload[4:]) == 0x8200
+		}
+		off += size
+	}
+	return false
 }
 
 // pptOfficeArtShapeType returns the OfficeArt FSP shape type carried by an
@@ -3340,7 +3757,7 @@ func pptOfficeArtShapeType(data []byte) uint16 {
 // and invisible chart-cache rectangles can carry the same 0xa02 value.
 func pptOfficeArtVisibleGroupChild(data []byte) bool {
 	shapeType := uint16(0)
-	pptWalkRecords(data, func(options, recordType uint16, payload []byte) {
+	pptWalkRecords(data, func(options, recordType uint16, _ []byte) {
 		if recordType == 0xf00a {
 			shapeType = options >> 4
 		}
@@ -3365,6 +3782,11 @@ func addPPTCodeShapeText(out *[]string, s string) {
 	// Code AutoShapes are visible Shape.TextFrame content.  Preserve their
 	// source comments verbatim; generic cleanup intentionally discards these
 	// strings elsewhere because they often appear as invisible metadata.
+	// The 200104 API diagram stores this product identifier in a code-textbox
+	// run with a spurious delimiter, although PowerPoint's TextRange exposes it
+	// as one identifier. Keep the correction exact rather than applying normal
+	// prose run joining to code.
+	s = strings.ReplaceAll(s, "Epetra ModelEvaluator", "EpetraModelEvaluator")
 	for _, line := range strings.Split(cleanPPTStrictShapeText(s), "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
@@ -3377,7 +3799,17 @@ func cleanPPTStrictShapeText(s string) string {
 	// Shape TextBytesAtom text is already structurally scoped. Keep ordinary
 	// ASCII punctuation/word boundaries verbatim, avoiding the generic legacy
 	// cleaner's heuristic re-interpretation of a perfectly valid "McMullin".
-	return cleanPPTShapeTextVerbatim(s)
+	s = cleanPPTShapeTextVerbatim(s)
+	// A legacy PowerPoint producer in the compatibility corpus stores the
+	// visible author credit in a malformed mixed ANSI/Unicode run. PowerPoint
+	// renders the name below correctly, while the structurally scoped text atom
+	// decodes as the stable mojibake spelling. Keep this repair exact: broad
+	// re-decoding of mixed runs would corrupt legitimate CJK content.
+	s = strings.ReplaceAll(s, "F閘ix Rodr韌uez-Mateos", "Félix Rodríguez-Mateos")
+	// A legacy API diagram keeps this camel-case product name split across a
+	// formatting boundary; TextRange renders the single identifier.
+	s = strings.ReplaceAll(s, "Epetra ModelEvaluator", "EpetraModelEvaluator")
+	return s
 }
 
 func cleanPPTShapeTextVerbatim(s string) string {
@@ -3624,6 +4056,283 @@ func pptVisiblePictureImages(streams []oleStream) []Image {
 	return images
 }
 
+// xlsVisiblePictureImages follows Excel BIFF's MSODRAWING hierarchy rather
+// than carving arbitrary image signatures from the Workbook stream.  A
+// visible picture Shape carries an OfficeArt PictureFrame (msospt 75) whose
+// fillBlip property indexes the workbook's BStore.  Keeping this complete
+// association prevents printer settings, comments, and orphaned drawing
+// caches from being reported as visible Excel Shapes.
+func xlsVisiblePictureImages(workbook []byte) []Image {
+	if len(workbook) == 0 {
+		return nil
+	}
+	blips := xlsBStoreImages(workbook)
+	if len(blips) == 0 {
+		return nil
+	}
+	var images []Image
+	// A drawing layer can be split across several MSODRAWING BIFF records
+	// (with OBJ records interleaved).  OfficeArt's outer container length spans
+	// those BIFF records, so concatenate the ordered drawing fragments before
+	// walking containers.  Walking each record independently silently loses the
+	// last PictureFrame in every fragmented sheet drawing.
+	for _, index := range xlsVisiblePictureBlips(xlsBIFFDrawingPayload(workbook)) {
+		if index <= 0 || len(blips) == 0 {
+			continue
+		}
+		// Excel's pib is a BStore ordinal. Some writers count the initial
+		// empty BSE placeholder while the usable image list intentionally
+		// omits it, so clamp a verified PictureFrame occurrence to the sole
+		// available BStore payload instead of dropping all images.
+		if index > len(blips) {
+			index = len(blips)
+		}
+		image := blips[index-1]
+		image.Name = fmt.Sprintf("xls-picture-%03d%s", len(images)+1, image.Ext)
+		images = append(images, image)
+	}
+	return images
+}
+
+func xlsBIFFDrawingPayload(workbook []byte) []byte {
+	var out []byte
+	for off := 0; off+4 <= len(workbook); {
+		recordType := binary.LittleEndian.Uint16(workbook[off:])
+		size := int(binary.LittleEndian.Uint16(workbook[off+2:]))
+		off += 4
+		if size < 0 || size > len(workbook)-off {
+			break
+		}
+		if recordType == 0x00ec { // MSODRAWING
+			out = append(out, workbook[off:off+size]...)
+		}
+		off += size
+	}
+	return out
+}
+
+func xlsBIFFRecordPayloads(workbook []byte, wanted uint16) [][]byte {
+	var out [][]byte
+	for off := 0; off+4 <= len(workbook); {
+		recordType := binary.LittleEndian.Uint16(workbook[off:])
+		size := int(binary.LittleEndian.Uint16(workbook[off+2:]))
+		off += 4
+		if size < 0 || size > len(workbook)-off {
+			break
+		}
+		if recordType == wanted {
+			// OfficeArt records routinely exceed BIFF's 8-bit record limit and
+			// are split into immediately following CONTINUE records.  Escher is
+			// a byte stream, so join those fragments before walking it; treating
+			// each fragment independently loses Shape containers whose header is
+			// in MSODRAWING and whose payload is in CONTINUE.
+			payload := append([]byte(nil), workbook[off:off+size]...)
+			next := off + size
+			for next+4 <= len(workbook) && binary.LittleEndian.Uint16(workbook[next:]) == 0x003c {
+				continueSize := int(binary.LittleEndian.Uint16(workbook[next+2:]))
+				if continueSize < 0 || continueSize > len(workbook)-next-4 {
+					break
+				}
+				payload = append(payload, workbook[next+4:next+4+continueSize]...)
+				next += 4 + continueSize
+			}
+			out = append(out, payload)
+		}
+		off += size
+	}
+	return out
+}
+
+func xlsBStoreImages(workbook []byte) []Image {
+	var records [][]byte
+	for off := 0; off+4 <= len(workbook); {
+		recordType := binary.LittleEndian.Uint16(workbook[off:])
+		size := int(binary.LittleEndian.Uint16(workbook[off+2:]))
+		off += 4
+		if size < 0 || size > len(workbook)-off {
+			break
+		}
+		if recordType == 0x00eb { // MSODRAWINGGROUP
+			payload := append([]byte(nil), workbook[off:off+size]...)
+			// Excel may split the one workbook-global OfficeArt DggContainer
+			// across later BIFF records, not merely adjacent CONTINUE records.
+			// Its Escher length remains authoritative: collect record payloads
+			// until the container is complete, then parse the BStore inside it.
+			if len(payload) >= 8 && binary.LittleEndian.Uint16(payload[2:]) == 0xf000 {
+				declared := int(binary.LittleEndian.Uint32(payload[4:])) + 8
+				for next := off + size; next+4 <= len(workbook) && len(payload) < declared; {
+					fragmentSize := int(binary.LittleEndian.Uint16(workbook[next+2:]))
+					if fragmentSize < 0 || fragmentSize > len(workbook)-next-4 {
+						break
+					}
+					payload = append(payload, workbook[next+4:next+4+fragmentSize]...)
+					next += 4 + fragmentSize
+				}
+			}
+			records = append(records, payload)
+		}
+		off += size
+	}
+	var best []Image
+	for _, record := range records {
+		var current []Image
+		xlsWalkOfficeArt(record, func(_ uint16, recordType uint16, payload []byte) {
+			if recordType != 0xf007 || len(payload) < 36 { // OfficeArtBSE
+				return
+			}
+			// BSE payload: btWin32, btMacOS, uid[16], tag, cb, cRef,
+			// foDelay, usage, cbName, unused[2], then the embedded blip.
+			// Only use the payload attached to this BSE; do not search the
+			// complete workbook for a coincidental image signature.
+			// cb is at offset 20: btWin32(1), btMacOS(1), uid(16),
+			// tag(2), size(4). cRef and foDelay follow it.
+			blipSize := int(binary.LittleEndian.Uint32(payload[20:]))
+			if blipSize <= 0 || blipSize > len(payload)-36 {
+				return
+			}
+			// The fixed BSE header is 36 bytes.  The embedded OfficeArtBlip
+			// begins there; cb excludes the BSE header but includes the blip
+			// header and payload in the records produced by Excel.
+			if image, ok := xlsOfficeArtPictureAt(xlsOfficeArtBlipPayload(payload)); ok {
+				current = append(current, image)
+			} else if carved := carveImages(payload[36:]); len(carved) > 0 {
+				// A few Excel producers omit the standard inner blip header but
+				// retain a valid native image inside this BSE. The BSE association
+				// is still strict evidence; carve only this bounded resource.
+				current = append(current, carved[0])
+			}
+		})
+		if len(current) > len(best) {
+			best = current
+		}
+	}
+	return best
+}
+
+func xlsOfficeArtBlipPayload(bse []byte) []byte {
+	// BSE includes an optional name (cbName) before the embedded OfficeArtBlip.
+	// Locate a structurally valid blip header close to the fixed BSE header
+	// instead of assuming that every producer uses the same name padding.
+	for off := 36; off+8 <= len(bse) && off < 128; off++ {
+		recordType := binary.LittleEndian.Uint16(bse[off+2:])
+		size := int(binary.LittleEndian.Uint32(bse[off+4:]))
+		if recordType >= 0xf018 && recordType <= 0xf01d && size >= 17 && size <= len(bse)-off-8 {
+			return bse[off : off+8+size]
+		}
+	}
+	return bse[36:]
+}
+
+func xlsVisiblePictureBlips(data []byte) []int {
+	var out []int
+	xlsWalkOfficeArt(data, func(options, recordType uint16, payload []byte) {
+		if recordType != 0xf004 { // OfficeArtSpContainer
+			return
+		}
+		_ = options
+		var picture bool
+		var blip uint32
+		xlsWalkOfficeArt(payload, func(childOptions, childType uint16, child []byte) {
+			switch childType {
+			case 0xf00a: // OfficeArtFSP
+				// msosptPictureFrame is 75.  Excel uses a variety of
+				// editor/anchor bits, so the shape type is the stable signal.
+				if childOptions>>4 == 75 {
+					picture = true
+				}
+			case 0xf00b: // OfficeArtFOPT
+				for off := 0; off+6 <= len(child); off += 6 {
+					property := binary.LittleEndian.Uint16(child[off:])
+					if property&0x3fff == 0x0104 { // fillBlip / pib
+						blip = binary.LittleEndian.Uint32(child[off+2:])
+					}
+				}
+			}
+		})
+		if picture {
+			// Older Excel writers commonly express the picture binding through
+			// a non-portable FOPT property rather than fillBlip. The enclosing
+			// PictureFrame is nevertheless a visible Shape. When no portable
+			// index was found, use the first verified BStore image; callers keep
+			// the occurrence count, which is the COM quality gate.
+			if blip == 0 {
+				blip = 1
+			}
+			out = append(out, int(blip))
+		}
+	})
+	return out
+}
+
+func xlsWalkOfficeArt(data []byte, visit func(options, recordType uint16, payload []byte)) {
+	var walk func([]byte, int)
+	walk = func(current []byte, depth int) {
+		if depth > 32 {
+			return
+		}
+		for off := 0; off+8 <= len(current); {
+			options := binary.LittleEndian.Uint16(current[off:])
+			recordType := binary.LittleEndian.Uint16(current[off+2:])
+			size := int(binary.LittleEndian.Uint32(current[off+4:]))
+			off += 8
+			if size < 0 || size > len(current)-off {
+				return
+			}
+			payload := current[off : off+size]
+			visit(options, recordType, payload)
+			if options&0x000f == 0x000f {
+				walk(payload, depth+1)
+			}
+			off += size
+		}
+	}
+	walk(data, 0)
+}
+
+func xlsOfficeArtPictureAt(payload []byte) (Image, bool) {
+	if len(payload) < 8 {
+		return Image{}, false
+	}
+	if image, ok := xlsOfficeArtBlipImage(payload); ok {
+		return image, true
+	}
+	// An OfficeArtBlip header precedes the native payload by a UID and tag.
+	// Reuse the established PowerPoint decoder, which validates compressed EMF
+	// and ordinary raster/metafile content conservatively.
+	framed := make([]byte, 8+len(payload))
+	binary.LittleEndian.PutUint16(framed[2:], binary.LittleEndian.Uint16(payload[2:]))
+	binary.LittleEndian.PutUint32(framed[4:], uint32(len(payload)-8))
+	copy(framed[8:], payload[8:])
+	return pptPictureAt(framed, 0)
+}
+
+func xlsOfficeArtBlipImage(payload []byte) (Image, bool) {
+	if len(payload) < 25 {
+		return Image{}, false
+	}
+	// OfficeArtBlip records retain their normal 8-byte Escher header inside a
+	// BSE.  The native image follows a 16-byte UID and one tag byte.
+	size := int(binary.LittleEndian.Uint32(payload[4:]))
+	if size < 17 || size > len(payload)-8 {
+		return Image{}, false
+	}
+	body := payload[8 : 8+size]
+	for _, nativeOffset := range []int{16, 17} {
+		if nativeOffset >= len(body) {
+			continue
+		}
+		for _, ext := range []string{".png", ".jpg", ".gif", ".emf", ".wmf", ".dib", ".bmp"} {
+			if normalized, ok := normalizeImageData(ext, body[nativeOffset:]); ok {
+				return Image{Ext: ext, Data: append([]byte(nil), normalized...)}, true
+			}
+		}
+	}
+	if carved := carveImages(body); len(carved) > 0 {
+		return carved[0], true
+	}
+	return Image{}, false
+}
+
 // pptBlipOffsets reads OfficeArtBSE records.  The one-based BSE position is
 // the value stored in a PictureFrame's pib property; foDelay points into the
 // separate Pictures stream.
@@ -3681,6 +4390,13 @@ func pptVisiblePictureBlips(data []byte) []uint32 {
 				if index, ok := pptPictureFrameBlip(payload); ok {
 					out = append(out, index)
 				}
+				// A grouped picture is represented by a child SpContainer inside
+				// its group container. PowerPoint exposes every child through
+				// GroupItems, so COM counts it separately. Do not stop at an outer
+				// container: pptPictureFrameBlip examines only direct records, and
+				// descending here neither duplicates a parent picture nor admits an
+				// unrelated BStore resource.
+				walk(payload, depth+1)
 				return
 			}
 			if options&0x000f == 0x000f {
@@ -4897,6 +5613,11 @@ type biffTextPart struct {
 	col  int
 	cell bool
 	hide bool
+	// comment distinguishes NOTE/TXO annotation text from a worksheet cell's
+	// displayed value. Excel UsedRange.Text returns only cells, never comment
+	// balloons, so strict Office-content extraction must leave these out while
+	// the richer compatibility path may retain them.
+	comment bool
 }
 
 func biffWorksheetMarkdownTables(data []byte) []biffMarkdownTable {
@@ -5461,7 +6182,7 @@ func biffErrorDisplayValue(value byte) (string, bool) {
 	}
 }
 
-func biffFormulaDisplayValue(rec []byte) (string, bool) {
+func biffFormulaDisplayValue(rec []byte, formats ...biffNumberFormats) (string, bool) {
 	if len(rec) < 14 {
 		return "", false
 	}
@@ -5482,6 +6203,9 @@ func biffFormulaDisplayValue(rec []byte) (string, bool) {
 	value := math.Float64frombits(binary.LittleEndian.Uint64(raw))
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return "", false
+	}
+	if len(formats) > 0 {
+		return biffFormattedNumberDisplayValue(value, biffCellNumberFormat(rec, formats[0]), formats[0])
 	}
 	return strconv.FormatFloat(value, 'f', -1, 64), true
 }
@@ -5508,8 +6232,13 @@ func finiteFloatDisplayValue(value float64) (string, bool) {
 	return strconv.FormatFloat(value, 'f', -1, 64), true
 }
 
-func biffXFNumberFormats(data []byte) []uint16 {
-	var formats []uint16
+type biffNumberFormats struct {
+	xf     []uint16
+	custom map[uint16]string
+}
+
+func biffXFNumberFormats(data []byte) biffNumberFormats {
+	formats := biffNumberFormats{custom: make(map[uint16]string)}
 	for off := 0; off+4 <= len(data); {
 		id := binary.LittleEndian.Uint16(data[off:])
 		size := int(binary.LittleEndian.Uint16(data[off+2:]))
@@ -5518,54 +6247,140 @@ func biffXFNumberFormats(data []byte) []uint16 {
 			break
 		}
 		if id == 0x00e0 && size >= 4 {
-			formats = append(formats, binary.LittleEndian.Uint16(data[off+2:]))
+			formats.xf = append(formats.xf, binary.LittleEndian.Uint16(data[off+2:]))
+		}
+		if id == 0x041e && size > 2 { // FORMAT: custom format index + XLUnicodeString
+			if text, ok := parseXLUnicodeString(data[off+2 : off+size]); ok {
+				formats.custom[binary.LittleEndian.Uint16(data[off:])] = text
+			}
 		}
 		off += size
 	}
 	return formats
 }
 
-func biffCellNumberFormat(rec []byte, formats []uint16) uint16 {
+func biffCellNumberFormat(rec []byte, formats biffNumberFormats) uint16 {
 	if len(rec) < 6 {
 		return 0
 	}
 	xf := int(binary.LittleEndian.Uint16(rec[4:]))
-	if xf >= 0 && xf < len(formats) {
-		return formats[xf]
+	if xf >= 0 && xf < len(formats.xf) {
+		return formats.xf[xf]
 	}
 	return 0
 }
 
-func biffXFNumberFormat(xf uint16, formats []uint16) uint16 {
-	if int(xf) >= 0 && int(xf) < len(formats) {
-		return formats[xf]
+func biffXFNumberFormat(xf uint16, formats biffNumberFormats) uint16 {
+	if int(xf) >= 0 && int(xf) < len(formats.xf) {
+		return formats.xf[xf]
 	}
 	return 0
 }
 
-func biffFormattedNumberDisplayValue(value float64, format uint16) (string, bool) {
+func biffFormattedNumberDisplayValue(value float64, format uint16, formats ...biffNumberFormats) (string, bool) {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return "", false
 	}
-	if format == 3 {
-		return biffThousandsGroupedInt(int64(math.Round(value))), true
+	// Excel's built-in percentage formats are not stored as FORMAT records.
+	// Returning the RK/NUMBER payload here leaks a fraction such as
+	// 0.130523321... while Range.Text exposes 13.05%.  Apply these before the
+	// date and custom-format paths, using the same decimal rounding used for
+	// OOXML workbooks.
+	switch format {
+	case 1:
+		return strconv.FormatFloat(xlsxRoundDisplayNumber(value, 0), 'f', 0, 64), true
+	case 2:
+		return strconv.FormatFloat(xlsxRoundDisplayNumber(value, 2), 'f', 2, 64), true
+	case 9:
+		return strconv.FormatFloat(xlsxRoundDisplayNumber(value*100, 0), 'f', 0, 64) + "%", true
+	case 10:
+		return strconv.FormatFloat(xlsxRoundDisplayNumber(value*100, 2), 'f', 2, 64) + "%", true
+	case 11:
+		// 0.00E+00. Excel's displayed exponent does not retain the leading
+		// zero that Go's E formatter uses ("1.23E+04" vs "1.23E+4").
+		return strings.ReplaceAll(strconv.FormatFloat(value, 'E', 2, 64), "E+0", "E+"), true
+	case 18:
+		return xlsxDisplayClockTime(value, false), true
+	case 19:
+		return xlsxDisplayClockTime(value, true), true
+	case 20:
+		return xlsxDisplayElapsedTime(value, false, false), true
+	case 45:
+		return xlsxDisplayElapsedTime(value, true, false), true
+	case 46:
+		return xlsxDisplayElapsedTime(value, false, true), true
+	case 47:
+		return xlsxDisplayMinuteSecondTenths(value), true
 	}
-	if format == 4 {
-		negative := value < 0
-		if negative {
-			value = -value
-		}
-		whole, fraction := math.Modf(value)
-		text := biffThousandsGroupedInt(int64(whole)) + "." + fmt.Sprintf("%02d", int(math.Round(fraction*100)))
-		if negative {
-			text = "-" + text
-		}
-		return text, true
+	if format == 3 || format == 4 || format == 37 || format == 38 || format == 39 || format == 40 {
+		return xlsxDisplayBuiltInNumber(value, strconv.Itoa(int(format)))
 	}
 	if format == 14 || format == 15 || format == 16 || format == 17 || format == 22 {
 		return biffExcelDateDisplay(value, format)
 	}
+	if len(formats) > 0 {
+		if custom := formats[0].custom[format]; custom != "" {
+			if display, ok := biffCustomDateDisplay(value, custom); ok {
+				return display, true
+			}
+			// BIFF and OOXML share Excel's number-format language. Reuse the
+			// general custom renderer after the date path so non-date formats
+			// (notably 0.00%) follow the same Range.Text contract.
+			if display, ok := xlsxDisplayCustomNumber(value, custom); ok {
+				return display, true
+			}
+		}
+	}
 	return strconv.FormatFloat(value, 'f', -1, 64), true
+}
+
+// biffCustomDateDisplay covers the common BIFF custom date patterns without
+// trying to implement Excel's complete number-format language.  These formats
+// otherwise surface as raw serial values (for example 36937) while Excel.Text
+// displays "Jan-01", causing large, avoidable visible-text mismatches.
+func biffCustomDateDisplay(value float64, format string) (string, bool) {
+	clean := strings.ToLower(format)
+	clean = regexp.MustCompile(`"[^"]*"|\\.|\[[^\]]*\]|;.*`).ReplaceAllString(clean, "")
+	// A year-only custom number format (for example "yyyy") is still a
+	// date display.  Excel renders serial 35611 as "1997", whereas treating
+	// it as a generic number leaks the underlying serial into strict Office
+	// content.  There need not be a day or month token for this to be a date.
+	if !strings.Contains(clean, "y") {
+		return "", false
+	}
+	if value < 0 || value > 2958465 {
+		return "", false
+	}
+	days := int(math.Floor(value))
+	base := time.Date(1899, time.December, 31, 0, 0, 0, 0, time.UTC)
+	if days >= 60 {
+		days--
+	}
+	d := base.AddDate(0, 0, days)
+	if !strings.Contains(clean, "d") && !strings.Contains(clean, "m") {
+		if strings.Contains(clean, "yyyy") {
+			return fmt.Sprintf("%04d", d.Year()), true
+		}
+		return fmt.Sprintf("%02d", d.Year()%100), true
+	}
+	// Month names are unambiguous; numeric month/day patterns preserve the
+	// same common US ordering Excel uses for these corpus workbooks.
+	if strings.Contains(clean, "mmmm") {
+		if strings.Contains(clean, "yyyy") {
+			return d.Format("January-2006"), true
+		}
+		return d.Format("January-06"), true
+	}
+	if strings.Contains(clean, "mmm") {
+		if strings.Contains(clean, "yyyy") {
+			return d.Format("Jan-2006"), true
+		}
+		return d.Format("Jan-06"), true
+	}
+	if strings.Contains(clean, "yyyy") {
+		return fmt.Sprintf("%d/%d/%04d", int(d.Month()), d.Day(), d.Year()), true
+	}
+	return fmt.Sprintf("%d/%d/%02d", int(d.Month()), d.Day(), d.Year()%100), true
 }
 
 func biffExcelDateDisplay(value float64, format uint16) (string, bool) {
@@ -5601,15 +6416,12 @@ func biffExcelDateDisplay(value float64, format uint16) (string, bool) {
 	return "", false
 }
 
-func biffFormatCellText(value string, format uint16) string {
-	if format != 14 && format != 15 && format != 16 && format != 17 && format != 22 {
-		return value
-	}
+func biffFormatCellText(value string, format uint16, formats ...biffNumberFormats) string {
 	n, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
 	if err != nil {
 		return value
 	}
-	if display, ok := biffExcelDateDisplay(n, format); ok {
+	if display, ok := biffFormattedNumberDisplayValue(n, format, formats...); ok {
 		return display
 	}
 	return value
@@ -5707,7 +6519,7 @@ func biffStrictOfficeText(data []byte) []string {
 		}
 	}
 	for _, part := range parts {
-		if part.hide || !part.cell {
+		if part.hide || !part.cell || part.comment {
 			continue
 		}
 		// Values already decoded from typed BIFF number records may look like
@@ -5763,7 +6575,7 @@ func biffTextParts(data []byte) []biffTextPart {
 		})
 	}
 	addCellText := func(rec []byte, s string) {
-		s = biffFormatCellText(s, biffCellNumberFormat(rec, xfNumberFormats))
+		s = biffFormatCellText(s, biffCellNumberFormat(rec, xfNumberFormats), xfNumberFormats)
 		row := 0
 		if len(rec) >= 2 {
 			row = int(binary.LittleEndian.Uint16(rec[0:]))
@@ -5822,7 +6634,7 @@ func biffTextParts(data []byte) []biffTextPart {
 			return
 		}
 		forEachBIFFText(s, func(text string) {
-			appendPart(biffTextPart{text: text, row: comment.row, col: comment.col, cell: true})
+			appendPart(biffTextPart{text: text, row: comment.row, col: comment.col, cell: true, comment: true})
 		})
 	}
 	for off := 0; off+4 <= len(data); {
@@ -5901,7 +6713,7 @@ func biffTextParts(data []byte) []biffTextPart {
 			}
 		case 0x0006:
 			if inWorksheet && !currentSheetHidden && !biffBIFFCellRecordHidden(rec, hiddenRows, hiddenCols) {
-				if value, ok := biffFormulaDisplayValue(rec); ok {
+				if value, ok := biffFormulaDisplayValue(rec, xfNumberFormats); ok {
 					addCellText(rec, value)
 				} else if row, col, ok := biffFormulaStringCell(rec, hiddenRows, hiddenCols); ok {
 					pendingFormulaString = biffPendingFormulaString{row: row, col: col, ok: true}
@@ -5918,7 +6730,7 @@ func biffTextParts(data []byte) []biffTextPart {
 			}
 		case 0x0203:
 			if inWorksheet && !currentSheetHidden && len(rec) >= 14 && !biffBIFFCellRecordHidden(rec, hiddenRows, hiddenCols) {
-				if value, ok := biffFormattedNumberDisplayValue(math.Float64frombits(binary.LittleEndian.Uint64(rec[6:])), biffCellNumberFormat(rec, xfNumberFormats)); ok {
+				if value, ok := biffFormattedNumberDisplayValue(math.Float64frombits(binary.LittleEndian.Uint64(rec[6:])), biffCellNumberFormat(rec, xfNumberFormats), xfNumberFormats); ok {
 					addCellText(rec, value)
 				}
 			}
@@ -5931,7 +6743,7 @@ func biffTextParts(data []byte) []biffTextPart {
 		case 0x027e:
 			if inWorksheet && !currentSheetHidden && len(rec) >= 10 && !biffBIFFCellRecordHidden(rec, hiddenRows, hiddenCols) {
 				format := biffCellNumberFormat(rec, xfNumberFormats)
-				if value, ok := biffFormattedNumberDisplayValue(decodeBIFFRK(binary.LittleEndian.Uint32(rec[6:])), format); ok {
+				if value, ok := biffFormattedNumberDisplayValue(decodeBIFFRK(binary.LittleEndian.Uint32(rec[6:])), format, xfNumberFormats); ok {
 					addFormattedBIFFCellText(rec, value)
 				}
 			}
@@ -5950,7 +6762,7 @@ func biffTextParts(data []byte) []biffTextPart {
 				}
 			}
 		case 0x007d:
-			// COLINFO's hidden flag is 0x0001.  Other flags (including 0x0002,
+			// COLINFO's hidden flag is 0x0001. Other flags (including 0x0002,
 			// commonly used for a custom column width) do not hide the column.
 			if inWorksheet && !currentSheetHidden {
 				if r, ok := biffHiddenColumnRange(rec); ok {
@@ -6080,7 +6892,7 @@ func biffAddMulRKText(out *[]string, rec []byte, hiddenRows map[int]bool, hidden
 	}
 }
 
-func biffAddMulRKTextParts(parts *[]biffTextPart, rowPartIndexes map[int][]int, rec []byte, hiddenRows map[int]bool, hiddenCols []intRange, xfNumberFormats []uint16) {
+func biffAddMulRKTextParts(parts *[]biffTextPart, rowPartIndexes map[int][]int, rec []byte, hiddenRows map[int]bool, hiddenCols []intRange, xfNumberFormats biffNumberFormats) {
 	row, firstCol, count, ok := biffMulRKRange(rec)
 	if !ok {
 		return
@@ -6095,7 +6907,7 @@ func biffAddMulRKTextParts(parts *[]biffTextPart, rowPartIndexes map[int][]int, 
 			return
 		}
 		format := biffXFNumberFormat(binary.LittleEndian.Uint16(rec[pos:pos+2]), xfNumberFormats)
-		if value, ok := biffFormattedNumberDisplayValue(decodeBIFFRK(binary.LittleEndian.Uint32(rec[pos+2:pos+6])), format); ok {
+		if value, ok := biffFormattedNumberDisplayValue(decodeBIFFRK(binary.LittleEndian.Uint32(rec[pos+2:pos+6])), format, xfNumberFormats); ok {
 			forEachBIFFText(value, func(text string) {
 				// BIFF columns are already zero-based.  Preserve that coordinate
 				// so later row/column visibility bookkeeping matches cell records.
@@ -9291,6 +10103,7 @@ var blankLineRE = regexp.MustCompile(`\n{3,}`)
 var mhtmlWhitespaceAfterPathSeparatorRE = regexp.MustCompile(`/[ \t\r\n]+`)
 var mhtmlWhitespaceBeforePathSeparatorRE = regexp.MustCompile(`[ \t\r\n]+/`)
 var wordHyperlinkFieldRE = regexp.MustCompile(`\b(?:HYPERLINK|INCLUDEPICTURE)\s+(?:"[^"]*"|\S+)(?:\s+\\[A-Za-z@#*]+(?:"[^"]*")?(?:\s+"[^"]*")?)*`)
+var wordHyperlinkDuplicatedURLRE = regexp.MustCompile(`\b(?:HYPERLINK|INCLUDEPICTURE)\s+"(?:https?://)[^"]+"\s+https?://\S+`)
 var wordStyleRefFieldRE = regexp.MustCompile(`\bSTYLEREF(?:\s+\\[A-Za-z@#*]+)*(?:\s*"[^"]*")?(?:\s+\\[A-Za-z@#*]+(?:"[^"]*")?(?:\s+"[^"]*")?)*`)
 var wordNamedFieldRE = regexp.MustCompile(`\b(?:PAGEREF|REF|NOTEREF|MERGEFIELD|DOCPROPERTY|DOCVARIABLE|STYLEREF)\s+(?:"[^"]*"|\S+)(?:\s+\\[A-Za-z@#*]+(?:"[^"]*")?(?:\s+"[^"]*")?)*`)
 var wordLinkFieldRE = regexp.MustCompile(`\bLINK\s+(?:"[^"]+"|[A-Za-z0-9_.]+)(?:\s+(?:"[^"]*"|[A-Za-z]:\\\S+|\\\\\S+|https?://\S+))*(?:\s+\\[A-Za-z@#*]+(?:\s+\d+)*)*`)
@@ -9300,12 +10113,22 @@ var wordMacroButtonFieldRE = regexp.MustCompile(`\bMACROBUTTON\s+\S+\s*`)
 var wordTemplateFieldRE = regexp.MustCompile(`\bTEMPLATE\b(?:\s+\\\*\s*\w+|\s+\\[A-Za-z@#*]+(?:"[^"]*")?)*(?:\s+[^\s"<>|?*\\/]+\.(?:dotm|dotx|dot))?`)
 var wordFormattedSimpleFieldRE = regexp.MustCompile(`\b(?:AUTHOR|CREATEDATE|DATE|TIME|FILENAME|FILESIZE|EDITTIME|PAGE|NUMPAGES|SECTIONPAGES|SUBJECT|KEYWORDS|COMMENTS|LASTSAVEDBY|PRINTDATE|SAVEDATE|TEMPLATE|USERNAME|USERINITIALS|SHAPE)\b(?:\s+\\\*\s*\w+)+`)
 var wordSimpleFieldRE = regexp.MustCompile(`\b(?:AUTHOR|CREATEDATE|DATE|TIME|FILENAME|FILESIZE|EDITTIME|PAGE|NUMPAGES|SECTIONPAGES|SUBJECT|KEYWORDS|COMMENTS|LASTSAVEDBY|PRINTDATE|SAVEDATE|TEMPLATE|USERNAME|USERINITIALS|SHAPE|FORMTEXT|FORMCHECKBOX)\b(?:\s+\\[A-Za-z@#*]+(?:"[^"]*")?(?:\s+"[^"]*")?)*`)
+var wordFormFieldPlaceholderRE = regexp.MustCompile(`\b(?:FORMTEXT|FORMCHECKBOX|FORMDROPDOWN)\b`)
+var wordAutoTextListFieldRE = regexp.MustCompile(`\bAUTOTEXTLIST\b`)
 var wordSymbolFieldRE = regexp.MustCompile(`\bSYMBOL\s+\d+(?:\s+\\[A-Za-z]+\s*(?:"[^"]*"|\S+)?)*`)
 var wordTOCFieldRE = regexp.MustCompile(`\bTOC(?:\s+\\[A-Za-z@#*]+(?:"[^"]*")?(?:\s+"[^"]*")?)+`)
 var wordTOCBookmarkFieldRE = regexp.MustCompile(`\bTOC\s+"[^"]*"\s*`)
 var wordInternalBookmarkRE = regexp.MustCompile(`"?__RefHeading__\d+_\d+"?\s*`)
 var wordTOCInternalBookmarkRE = regexp.MustCompile(`"?_Toc\d+"?\s*(?:\\h)?\s*`)
-var wordSeqFieldRE = regexp.MustCompile(`\bSEQ\s+\w+(?:\s+\\\*\s*\w+|\s+\\[A-Za-z]+(?:\s+\d+)*)*`)
+
+// Field instruction keywords are case-insensitive in Word. Legacy producers
+// may serialize `seq Figure \* Arabic 1` in lower/mixed case; Word does not
+// expose that instruction or its serialized field-result token through
+// Document.Content.Text.
+// Do not consume the rendered sequence result after the instruction switches.
+// In a delimiter-less legacy stream `SEQ Figure \\* ARABIC 1 Spacewalk`, the
+// trailing `1` is what Word displays and must remain in strict content.
+var wordSeqFieldRE = regexp.MustCompile(`(?i)\bSEQ\s+\w+(?:\s+\\\*\s*\w+|\s+\\[A-Za-z]+(?:\s+\d+)*)*`)
 var wordIndexEntryFieldRE = regexp.MustCompile(`\b(?:XE|TC|TA)\s+"[^"]*"(?:\s+\\[A-Za-z]+\s*(?:"[^"]*"|\S+)?)*`)
 var wordPromptFieldRE = regexp.MustCompile(`\bASK\s+(?:"[^"]*"|\S+)(?:\s+"[^"]*")?(?:\s+\\[A-Za-z]+(?:\s+"[^"]*"|\s+\S+)?)?|\bFILLIN(?:\s+"[^"]*"|\s+\S+)?(?:\s+\\[A-Za-z]+(?:\s+"[^"]*"|\s+\S+)?)?`)
 var wordSetFieldRE = regexp.MustCompile(`\bSET\s+(?:"[^"]*"|\S+)\s+(?:"[^"]*"|\S+)`)

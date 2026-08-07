@@ -109,7 +109,69 @@ go run ./cmd/officebaseline `
 
 This test-only command opens files read-only through Word, PowerPoint, and Excel COM automation with macros disabled, then compares their visible text tokens and picture-shape counts to `officeread`. It reports token recall (content Office exposes that was retained), precision (extracted content Office also exposes), F1, and image-count deltas. Keep the thresholds per format and sample corpus: Office's object model represents a few content types differently from the package-level extractor.
 
+For reproducible COM audits, keep Office sessions isolated and persist a checkpoint after every file. The following form is recommended for representative or heterogeneous legacy samples:
+
+```powershell
+$env:OFFICEBASELINE_SCRIPT = Join-Path (Get-Location) 'tools\office_baseline.ps1'
+go run ./cmd/officebaseline `
+  -batch-size 1 `
+  -checkpoint 1 `
+  -timeout 60s `
+  -json reports/batches/office-com-audit.json `
+    testdata/web-samples/samples/ppt/000289.ppt `
+    testdata/web-samples/samples/pptx/00022654.pptx
+```
+
+Do not terminate `WINWORD`, `POWERPNT`, or `EXCEL` indiscriminately before an
+audit: those processes can be a user's interactive Office session.  On a
+timeout, `officebaseline` cleans up only Office processes whose command line
+identifies them as automation servers (`/Automation` or `-Embedding`).
+
+For a resumable full-corpus run, use the supervisor.  It compiles the test
+tool once, runs one isolated COM comparison per checkpoint, retains a durable
+path-level record for all files (including COM-unavailable ones), and resumes
+after interruption.  Excel workbooks are deliberately isolated because one
+modal or damaged workbook must not poison a later comparison.
+
+```powershell
+$env:GOCACHE = Join-Path (Get-Location) '.gocache'
+.\tools\run_officebaseline_full.ps1 `
+  -InputPath testdata\web-samples\samples\xlsx `
+  -ReportPath reports\batches\office-com-xlsx-bulk.json `
+  -SliceSize 1 -TimeoutSeconds 30 -KillGraceSeconds 3 `
+  -StartupGraceSeconds 10 -BaselineRetries 2 -ExcelMaxCells 0
+```
+
+`ExcelMaxCells 0` deliberately selects a single-call `Value2` baseline for
+full-range coverage.  Such records are reported as `office-stored-value` and
+are excluded from the strict `office-visible` quality gate; rerun strict
+visible records with a positive limit when judging formatted Excel text.  View
+the audit without relying on Windows PowerShell's Unicode-sensitive JSON
+decoder:
+
+```powershell
+python tools\office_baseline_report.py reports\batches\office-com-xlsx-bulk.json
+# Cross-format coverage and strict-quality accounting:
+python tools\office_baseline_report.py --suite reports\batches
+```
+
+The report's `qualityGate` treats text and visible picture occurrence counts as mandatory. Pixel/image-byte equality is supplementary only: `Shape.Export` can rasterize, scale, or re-encode the same Office picture. A `baseline-unavailable` result denotes a COM/Office transport failure, not an extractor mismatch; rerun it with `-resume` after restoring the Office process.
+
 `officebaseline` enables `StrictOfficeImages` and `StrictOfficeContent`. The former makes PPTX image comparison follow PowerPoint Picture Shapes (excluding layout/master artwork and OLE previews); the latter limits OOXML text to Office's primary document content, excluding cached chart/drawing data. The regular API and CLI retain compatibility-oriented recovery by default; opt in with `-strict-office-images` and `-strict-office-content` when exact Office semantics are required.
+
+For legacy `.ppt`, treat a PowerPoint resave to `.pptx` as a diagnostic normalization step, not as part of `officeread`'s extraction path. Some binary presentations place visible nested group text and non-visible chart-cache text in structurally ambiguous OfficeArt records. The strict reader deliberately prefers avoiding chart-cache leakage. For a maximum-fidelity, explicitly Office-dependent audit, use `-normalize-legacy-ppt`:
+
+```powershell
+go run ./cmd/officebaseline `
+  -normalize-legacy-ppt `
+  -batch-size 1 `
+  -checkpoint 1 `
+  -timeout 90s `
+  -json reports/batches/office-com-normalized-ppt.json `
+  testdata/web-samples/samples/ppt/000289.ppt
+```
+
+It opens the source read-only with macros disabled, creates an Office-authored PPTX in a temporary directory, extracts only that temporary copy, then removes it. It never overwrites the original and the JSON record marks it with `normalizedFromOffice: true`. The same diagnostic option is available for legacy Word field/story serialization with `-normalize-legacy-doc`; it creates a temporary DOCX. This separates a binary-record ambiguity from an OOXML extraction issue without making the production library depend on Office.
 
 ### API
 

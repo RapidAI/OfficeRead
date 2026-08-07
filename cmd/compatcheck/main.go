@@ -65,6 +65,20 @@ type Report struct {
 	Files      []FileResult          `json:"files"`
 }
 
+// progressWriter persists a complete, parseable checkpoint while a long
+// compatibility sweep is still running. A 6008-file corpus can contain a
+// handful of hostile documents; without checkpoints an interruption loses
+// every successful pure-Go extraction before the last file.
+type progressWriter struct {
+	jsonPath string
+	csvPath  string
+	report   *Report
+	results  []FileResult
+	done     []bool
+	next     int
+	mu       sync.Mutex
+}
+
 func main() {
 	jsonOut := flag.String("json", "compat-report.json", "JSON report path")
 	csvOut := flag.String("csv", "compat-report.csv", "CSV report path")
@@ -96,7 +110,8 @@ func main() {
 		Inputs:    flag.Args(),
 		Summary:   map[string]ExtSummary{},
 	}
-	for _, res := range checkFiles(files, *repeat, *markdown, *jobs) {
+	progress := &progressWriter{jsonPath: *jsonOut, csvPath: *csvOut, report: &report, results: make([]FileResult, len(files)), done: make([]bool, len(files))}
+	for _, res := range checkFiles(files, *repeat, *markdown, *jobs, progress.record) {
 		report.Files = append(report.Files, res)
 		s := report.Summary[res.Ext]
 		s.Total++
@@ -131,7 +146,10 @@ func main() {
 		}
 	}
 	report.FinishedAt = time.Now().Format(time.RFC3339)
-
+	// The worker result slice is held only until every requested file has
+	// completed. Release the separate progress buffers before serializing the
+	// final report; retaining both doubled memory on a 6008-file corpus.
+	progress.release()
 	if err := writeJSON(*jsonOut, report); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -145,7 +163,11 @@ func main() {
 	}
 }
 
-func checkFiles(files []string, repeat int, markdown bool, jobs int) []FileResult {
+func checkFiles(files []string, repeat int, markdown bool, jobs int, callbacks ...func(int, FileResult)) []FileResult {
+	var onResult func(int, FileResult)
+	if len(callbacks) > 0 {
+		onResult = callbacks[0]
+	}
 	results := make([]FileResult, len(files))
 	if len(files) == 0 {
 		return results
@@ -161,6 +183,9 @@ func checkFiles(files []string, repeat int, markdown bool, jobs int) []FileResul
 			defer workers.Done()
 			for index := range indexes {
 				results[index] = checkOne(files[index], repeat, markdown)
+				if onResult != nil {
+					onResult(index, results[index])
+				}
 			}
 		}()
 	}
@@ -170,6 +195,70 @@ func checkFiles(files []string, repeat int, markdown bool, jobs int) []FileResul
 	close(indexes)
 	workers.Wait()
 	return results
+}
+
+func (p *progressWriter) record(index int, result FileResult) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.results[index] = result
+	p.done[index] = true
+	// Workers can complete out of order. Retain only the known prefix, but
+	// keep later records in the map until their predecessors complete.
+	for p.next < len(p.done) {
+		if !p.done[p.next] {
+			break
+		}
+		p.next++
+	}
+	if p.next == 0 || (p.next%25 != 0 && p.next != len(p.done)) {
+		return
+	}
+	checkpoint := *p.report
+	checkpoint.Files = append([]FileResult(nil), p.results[:p.next]...)
+	checkpoint.Summary = summarizeFiles(checkpoint.Files)
+	checkpoint.FinishedAt = ""
+	_ = writeJSON(p.jsonPath, checkpoint)
+	_ = writeCSV(p.csvPath, checkpoint.Files)
+}
+
+func (p *progressWriter) release() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.results = nil
+	p.done = nil
+}
+
+func summarizeFiles(files []FileResult) map[string]ExtSummary {
+	summary := map[string]ExtSummary{}
+	for _, res := range files {
+		s := summary[res.Ext]
+		s.Total++
+		s.Millis += res.Millis
+		if res.Millis > s.MaxMillis {
+			s.MaxMillis = res.Millis
+		}
+		if res.Millis > 10000 {
+			s.Over10Sec++
+		}
+		if res.OK {
+			s.OK++
+		}
+		if res.Error != "" {
+			s.Errors++
+		}
+		if res.Panic != "" {
+			s.Panics++
+		}
+		if res.Empty {
+			s.Empty++
+		}
+		s.TextBytes += int64(res.TextBytes)
+		s.Images += int64(res.Images)
+		s.MarkdownBytes += int64(res.MarkdownBytes)
+		s.MarkdownImages += int64(res.MarkdownImages)
+		summary[res.Ext] = s
+	}
+	return summary
 }
 
 func collectFiles(inputs []string, limitPerExt int) ([]string, error) {
@@ -289,18 +378,42 @@ func markdownImageReferenceCount(markdown string) int {
 			break
 		}
 		markdown = markdown[i+2:]
-		closeAlt := strings.IndexByte(markdown, ']')
+		closeAlt := markdownUnescapedByteIndex(markdown, ']')
 		if closeAlt < 0 || closeAlt+1 >= len(markdown) || markdown[closeAlt+1] != '(' {
+			markdown = markdown[1:]
 			continue
 		}
-		closeURL := strings.IndexByte(markdown[closeAlt+2:], ')')
+		closeURL := markdownUnescapedByteIndex(markdown[closeAlt+2:], ')')
 		if closeURL < 0 {
+			markdown = markdown[1:]
 			continue
 		}
 		count++
 		markdown = markdown[closeAlt+3+closeURL:]
 	}
 	return count
+}
+
+// markdownUnescapedByteIndex finds a Markdown delimiter while honoring a
+// backslash escape. Image alt text routinely contains literal brackets (for
+// example "asset[1]") and markdownImageReferenceCount must not report those
+// valid references as missing merely because their closing bracket is escaped.
+func markdownUnescapedByteIndex(s string, want byte) int {
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if s[i] == '\\' {
+			escaped = true
+			continue
+		}
+		if s[i] == want {
+			return i
+		}
+	}
+	return -1
 }
 
 func writeJSON(path string, report Report) error {

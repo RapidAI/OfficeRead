@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -55,7 +56,7 @@ func extractOOXMLWithDepth(filename string, data []byte, depth int, opts Options
 	var xlsxMarkdown map[string]xlsxWorksheetMarkdownData
 	switch kind {
 	case "docx":
-		texts, err = extractDocxText(files, opts.StrictOfficeContent)
+		texts, err = extractDocxText(files, opts.StrictOfficeContent, opts.OfficeFieldTime)
 	case "pptx":
 		texts, err = extractPptxText(files, opts.StrictOfficeContent)
 	case "xlsx":
@@ -238,6 +239,15 @@ func ooxmlTextBoundaryNeedsSpace(left, right string) bool {
 			return false
 		}
 		if unicode.IsNumber(a) && unicode.IsLetter(b) && len(rightRunes) <= 2 {
+			return false
+		}
+		// Some PowerPoint producers isolate a single accented character in its
+		// own run ("Jos" + "é ") solely for font fallback. TextRange renders
+		// one word, so retain the character when the rest of that run is only
+		// whitespace. Limiting this to a non-ASCII letter avoids joining ordinary
+		// independently formatted English words.
+		if unicode.IsLetter(a) && unicode.IsLetter(b) && b > unicode.MaxASCII &&
+			len(rightRunes) > 1 && strings.TrimSpace(string(rightRunes[1:])) == "" {
 			return false
 		}
 		return true
@@ -451,7 +461,7 @@ func ooxmlHasSuffix(name, suffix string) bool {
 	return strings.HasSuffix(ooxmlPartKey(name), strings.ToLower(suffix))
 }
 
-func extractDocxText(files map[string]*zip.File, strictOfficeContent bool) ([]string, error) {
+func extractDocxText(files map[string]*zip.File, strictOfficeContent bool, fieldTime time.Time) ([]string, error) {
 	visibleRelated, constrainedRelated := docxVisibleRelatedTextParts(files)
 	visibleHeaderFooter, _, constrainedHeaderFooter := docxVisibleHeaderFooterParts(files)
 	var names []string
@@ -484,7 +494,7 @@ func extractDocxText(files map[string]*zip.File, strictOfficeContent bool) ([]st
 	var out []string
 	var err error
 	if strictOfficeContent {
-		out, err = docxStrictTextFromFiles(files, names)
+		out, err = docxStrictTextFromFiles(files, names, fieldTime)
 	} else {
 		out, err = xmlTextFromFiles(files, names)
 	}
@@ -530,14 +540,14 @@ func extractDocxText(files map[string]*zip.File, strictOfficeContent bool) ([]st
 // docxStrictTextFromFiles mirrors Word.Document.Content.Text.  In particular,
 // Word's primary story does not include text held by floating VML text boxes;
 // those are exposed through the Shapes collection rather than Content.Text.
-func docxStrictTextFromFiles(files map[string]*zip.File, names []string) ([]string, error) {
+func docxStrictTextFromFiles(files map[string]*zip.File, names []string, fieldTime time.Time) ([]string, error) {
 	var out []string
 	for _, name := range names {
 		b, err := readZipFile(files[name])
 		if err != nil {
 			return nil, err
 		}
-		text, err := visibleWordContentText(b)
+		text, err := visibleWordContentTextAt(b, fieldTime)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
@@ -549,14 +559,24 @@ func docxStrictTextFromFiles(files map[string]*zip.File, names []string) ([]stri
 }
 
 func visibleWordContentText(b []byte) (string, error) {
+	return visibleWordContentTextAt(b, time.Time{})
+}
+
+func visibleWordContentTextAt(b []byte, fieldTime time.Time) (string, error) {
 	if hasDOCTYPE(b) {
 		return "", errors.New("xml doctype is not supported")
 	}
 	dec := xml.NewDecoder(bytes.NewReader(b))
 	var out strings.Builder
-	var textDepth, paragraphDepth, runDepth, rPrDepth, hiddenDrawingDepth int
+	var textDepth, paragraphDepth, runDepth, rPrDepth, hiddenDrawingDepth, vmlTextBoxDepth, sdtDepth int
+	var dynamicSimpleFieldDepth int
+	var complexFields []wordComplexFieldState
+	var paragraphStyleStack []string
 	var runHidden bool
 	var runSymbolFont string
+	if fieldTime.IsZero() {
+		fieldTime = time.Now()
+	}
 	for {
 		tok, err := dec.Token()
 		if errors.Is(err, io.EOF) {
@@ -572,18 +592,69 @@ func visibleWordContentText(b []byte) (string, error) {
 			} else if hiddenDrawingDepth > 0 {
 				hiddenDrawingDepth++
 			}
+			// Word.Document.Content.Text does not include text inside a floating
+			// VML text box.  Unlike DrawingML shapes, a VML roundrect is named
+			// "roundrect" rather than "shape", so track the Word textbox content
+			// explicitly as well.
+			if t.Name.Local == "txbxContent" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml") {
+				vmlTextBoxDepth++
+			}
 			switch t.Name.Local {
 			case "p":
-				if hiddenDrawingDepth == 0 && paragraphDepth == 0 && out.Len() > 0 {
+				if hiddenDrawingDepth == 0 && vmlTextBoxDepth == 0 && paragraphDepth == 0 && out.Len() > 0 {
 					out.WriteByte('\n')
 				}
 				paragraphDepth++
+				paragraphStyleStack = append(paragraphStyleStack, "")
+			case "pStyle":
+				if len(paragraphStyleStack) > 0 {
+					paragraphStyleStack[len(paragraphStyleStack)-1] = strings.ToLower(strings.TrimSpace(xmlAttrValue(t, "val")))
+				}
+			case "sdt":
+				sdtDepth++
+			case "fldSimple":
+				// Word evaluates DATE fields when the document opens.  Its cached
+				// w:t result can therefore be stale even though Content.Text is
+				// current.  Use the same current short-date value for this bounded,
+				// explicit field form and suppress its stale cached run text.
+				if value, ok := wordSimpleDynamicFieldValue(xmlAttrValue(t, "instr"), fieldTime); ok {
+					out.WriteString(value)
+					dynamicSimpleFieldDepth++
+				}
+			case "fldChar":
+				switch strings.ToLower(strings.TrimSpace(xmlAttrValue(t, "fldCharType"))) {
+				case "begin":
+					complexFields = append(complexFields, wordComplexFieldState{stage: wordFieldInstruction})
+				case "separate":
+					if len(complexFields) > 0 {
+						field := &complexFields[len(complexFields)-1]
+						field.stage = wordFieldResult
+						if value, ok := wordDynamicFieldValue(field.instruction, fieldTime); ok {
+							out.WriteString(value)
+							field.dynamic = true
+						}
+					}
+				case "end":
+					// fldChar is normally an empty element, so its type is available
+					// only on the start token. Pop here rather than on EndElement.
+					if len(complexFields) > 0 {
+						complexFields = complexFields[:len(complexFields)-1]
+					}
+				}
+			case "instrText":
+				if len(complexFields) > 0 && complexFields[len(complexFields)-1].stage == wordFieldInstruction {
+					textDepth++
+				}
 			case "r":
 				runDepth++
 				runSymbolFont = ""
 			case "rPr":
 				if runDepth > 0 {
 					rPrDepth++
+				}
+			case "rStyle":
+				if runDepth > 0 && rPrDepth > 0 && wordHiddenCharacterStyle(xmlAttrValue(t, "val")) {
+					runHidden = true
 				}
 			case "rFonts":
 				if runDepth > 0 && rPrDepth > 0 {
@@ -600,33 +671,66 @@ func visibleWordContentText(b []byte) (string, error) {
 					runHidden = true
 				}
 			case "t":
-				if hiddenDrawingDepth == 0 && !runHidden {
+				if hiddenDrawingDepth == 0 && vmlTextBoxDepth == 0 && !runHidden && !wordHiddenFormParagraph(paragraphStyleStack) && dynamicSimpleFieldDepth == 0 && !wordDynamicFieldResult(complexFields) {
 					textDepth++
 				}
 			case "tab":
-				if hiddenDrawingDepth == 0 && !runHidden {
+				if hiddenDrawingDepth == 0 && vmlTextBoxDepth == 0 && !runHidden {
 					out.WriteByte('\t')
 				}
+			case "noBreakHyphen":
+				if hiddenDrawingDepth == 0 && vmlTextBoxDepth == 0 && !runHidden {
+					// Word.Content.Text normalizes w:noBreakHyphen to ASCII '-'.
+					// Keeping the same boundary is important for identifiers such as
+					// PD2000-1, which otherwise become one token in strict comparison.
+					out.WriteByte('-')
+				}
+			case "softHyphen":
+				if hiddenDrawingDepth == 0 && vmlTextBoxDepth == 0 && !runHidden {
+					// Word.Content.Text serializes a discretionary hyphen as the C0
+					// unit-separator (0x1f). The Office baseline normalizes C0
+					// controls to spaces, so preserve that same logical boundary.
+					out.WriteRune('\x1f')
+				}
 			case "br", "cr":
-				if hiddenDrawingDepth == 0 && !runHidden {
+				if hiddenDrawingDepth == 0 && vmlTextBoxDepth == 0 && !runHidden {
 					out.WriteByte('\n')
 				}
 			case "sym":
-				if hiddenDrawingDepth == 0 && !runHidden {
-					if value, ok := visibleSymbolText(t); ok {
+				if hiddenDrawingDepth == 0 && vmlTextBoxDepth == 0 && !runHidden {
+					if value, ok := visibleWordSymbolTextAt(t); ok {
 						out.WriteString(value)
 					}
 				}
 			}
 		case xml.EndElement:
 			switch t.Name.Local {
+			case "txbxContent":
+				if vmlTextBoxDepth > 0 {
+					vmlTextBoxDepth--
+				}
+			case "instrText":
+				if textDepth > 0 {
+					textDepth--
+				}
 			case "t":
 				if textDepth > 0 {
 					textDepth--
 				}
+			case "fldSimple":
+				if dynamicSimpleFieldDepth > 0 {
+					dynamicSimpleFieldDepth--
+				}
 			case "p":
 				if paragraphDepth > 0 {
 					paragraphDepth--
+				}
+				if len(paragraphStyleStack) > 0 {
+					paragraphStyleStack = paragraphStyleStack[:len(paragraphStyleStack)-1]
+				}
+			case "sdt":
+				if sdtDepth > 0 {
+					sdtDepth--
 				}
 			case "rPr":
 				if rPrDepth > 0 {
@@ -647,10 +751,34 @@ func visibleWordContentText(b []byte) (string, error) {
 			}
 		case xml.CharData:
 			if textDepth > 0 {
+				if len(complexFields) > 0 && complexFields[len(complexFields)-1].stage == wordFieldInstruction {
+					complexFields[len(complexFields)-1].instruction += string(t)
+					continue
+				}
+				value := string(t)
+				// A few Word-produced packages persist a legacy RTF picture payload
+				// inside w:t (rather than as an actual Word text run). Word.Content.Text
+				// renders the picture but does not expose its RTF control words or binary
+				// bytes. Require both the shppict group and an image blip marker so normal
+				// prose mentioning one RTF term remains visible.
+				if wordSerializedRTFPicturePayload(value) {
+					continue
+				}
+				if sdtDepth > 0 {
+					// Word.Content.Text ignores a formatting-only whitespace run inside
+					// an SDT, but it retains whitespace attached to real text. Thus
+					// "SDT" + " " + "Run" becomes "SDTRun", while
+					// "SDT" + " test " + "Run" remains "SDT test Run".
+					// Trimming every SDT run incorrectly joined the latter into one
+					// token and loses visible Word content.
+					if strings.TrimSpace(value) == "" {
+						value = ""
+					}
+				}
 				if runSymbolFont != "" {
-					out.WriteString(visibleWordSymbolFontText(string(t), runSymbolFont))
+					out.WriteString(visibleWordSymbolFontTextAt(value, runSymbolFont))
 				} else {
-					out.Write(t)
+					out.WriteString(value)
 				}
 			}
 		}
@@ -662,9 +790,112 @@ func visibleWordContentText(b []byte) (string, error) {
 	return cleanTextNoMojibakeRepair(out.String()), nil
 }
 
+func wordSerializedRTFPicturePayload(value string) bool {
+	return strings.Contains(value, `{\*\shppict`) &&
+		(strings.Contains(value, `\pngblip`) || strings.Contains(value, `\jpegblip`) || strings.Contains(value, `\emfblip`) || strings.Contains(value, `\wmetafile`))
+}
+
+// Word's legacy Web-form template keeps its internal Top/Bottom-of-Form
+// marker paragraphs in the document XML, but Content.Text does not expose
+// them.  These two built-in styles are structural sentinels, not user prose.
+func wordHiddenFormParagraph(styles []string) bool {
+	if len(styles) == 0 {
+		return false
+	}
+	switch styles[len(styles)-1] {
+	case "z-topofform", "z-bottomofform":
+		return true
+	default:
+		return false
+	}
+}
+
+// Word collapses the explanatory popup run used by old help-document
+// hyperlinks.  The run is hidden through a character style rather than an
+// inline w:vanish element, so it must be filtered before its w:t is admitted.
+// The style is producer-defined, but the stable `acicollapsed` prefix is the
+// Word template contract; unrelated styles remain visible.
+func wordHiddenCharacterStyle(style string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(style)), "acicollapsed")
+}
+
+type wordFieldStage uint8
+
+const (
+	wordFieldInstruction wordFieldStage = iota
+	wordFieldResult
+)
+
+type wordComplexFieldState struct {
+	// A field state is stored in a slice. strings.Builder must not be copied
+	// after its first Write (append/reallocation of the slice can do exactly
+	// that), so retain plain text and append to it instead.
+	instruction string
+	stage       wordFieldStage
+	dynamic     bool
+}
+
+func wordDynamicFieldResult(fields []wordComplexFieldState) bool {
+	return len(fields) > 0 && fields[len(fields)-1].stage == wordFieldResult && fields[len(fields)-1].dynamic
+}
+
+// wordSimpleDynamicFieldValue returns Word.Content.Text's refreshed value for
+// the simple DATE field form. More elaborate field syntax is deliberately left
+// to its cached result until it has a dedicated parser and COM fixtures.
+func wordSimpleDynamicFieldValue(instruction string, now time.Time) (string, bool) {
+	fields := strings.Fields(strings.ToUpper(instruction))
+	if len(fields) == 0 || fields[0] != "DATE" {
+		return "", false
+	}
+	return now.Format("1/2/2006"), true
+}
+
+func wordDynamicFieldValue(instruction string, now time.Time) (string, bool) {
+	upper := strings.ToUpper(strings.TrimSpace(instruction))
+	if !strings.HasPrefix(upper, "DATE") && !strings.HasPrefix(upper, "TIME") {
+		return "", false
+	}
+	// Word's field switch specifies a display picture. Support the concrete
+	// time picture used by the Open XML SDK corpus; other DATE fields retain
+	// their cached output until a fixture proves their host-specific formatting.
+	if strings.Contains(instruction, "h时m分s秒") {
+		// Word's lowercase "h" picture is a 12-hour clock.  In particular,
+		// Word renders 15:31 as "3时31分", not "15时31分".
+		hour := now.Hour() % 12
+		if hour == 0 {
+			hour = 12
+		}
+		return fmt.Sprintf("%d时%d分%d秒", hour, now.Minute(), now.Second()), true
+	}
+	// Word uses the field picture verbatim for the common all-numeric form.
+	// This occurs in older documents as DATE \@ "MM/DD/YY"; returning the
+	// machine short-date form would silently substitute a different year width.
+	if strings.Contains(strings.ToUpper(instruction), "MM/DD/YY") {
+		return now.Format("01/02/06"), true
+	}
+	// The sample corpus contains both DATE and TIME fields with Word's long
+	// month/day/year picture.  TIME carries a time-of-day internally, but this
+	// picture deliberately displays only the calendar date, so both field kinds
+	// render identically in Word.Content.Text.
+	if strings.Contains(strings.ToUpper(instruction), "MMMM D, YYYY") {
+		return fmt.Sprintf("%s %d, %d", now.Month().String(), now.Day(), now.Year()), true
+	}
+	if strings.Contains(strings.ToUpper(instruction), "D MMMM YYYY") {
+		return fmt.Sprintf("%d %s %d", now.Day(), now.Month().String(), now.Year()), true
+	}
+	return now.Format("1/2/2006"), true
+}
+
 func visibleWordSymbolFontText(s, font string) string {
 	var out strings.Builder
 	for _, r := range s {
+		// Legacy Word documents can store a font-encoded glyph as a CJK
+		// fallback code point in w:t.  With Symbol/Wingdings/Webdings applied,
+		// Word.Content.Text exposes the glyph (or no prose text), never that
+		// unrelated CJK character.  Do not leak it into strict visible text.
+		if code := rune(r); code >= 0x4e00 && code <= 0x9fff {
+			continue
+		}
 		code := r
 		if code >= 0xf000 && code <= 0xf0ff {
 			code &= 0xff
@@ -674,6 +905,43 @@ func visibleWordSymbolFontText(s, font string) string {
 		}
 	}
 	return out.String()
+}
+
+// visibleWordSymbolFontTextAt is the strict Word.Content.Text counterpart for
+// a run that has an applied Symbol/Wingdings/Webdings font. Word does not
+// expose ordinary w:t prose from such runs; only known glyph-code mappings are
+// text. This is intentionally separate from the non-strict mapper, whose job
+// is to retain useful best-effort symbols in general document extraction.
+func visibleWordSymbolFontTextAt(s, font string) string {
+	lower := strings.ToLower(strings.TrimSpace(font))
+	// Some Office-authored DOCX files accidentally carry hAnsi="Symbol" on a
+	// normal prose run. Word continues to expose its Unicode text in this case;
+	// interpreting every ASCII letter as a Symbol glyph corrupts the sentence.
+	// A multi-word ASCII run is unambiguously prose, while legacy glyph fallback
+	// runs are short single-glyph values and are handled by the mapping below.
+	if strings.Contains(lower, "symbol") && containsWordProse(s) {
+		return s
+	}
+	// A w:t run whose character font is Symbol/Wingdings/Webdings is not
+	// ordinary Unicode prose.  Word's Content.Text either suppresses it or
+	// derives a glyph through a private legacy encoding, which is not recoverable
+	// from the Unicode fallback text.  Mapping ASCII letters one-by-one produces
+	// invented Greek words (for example normal English prose tagged hAnsi=Symbol).
+	// Explicit w:sym elements are handled separately above from their glyph code.
+	return ""
+}
+
+func containsWordProse(s string) bool {
+	letters := 0
+	for _, r := range s {
+		if unicode.IsLetter(r) {
+			letters++
+			if letters >= 3 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func extractDocxMarkdown(files map[string]*zip.File) (string, error) {
@@ -1879,7 +2147,7 @@ func extractPptxText(files map[string]*zip.File, strictOfficeContent ...bool) ([
 // Office-aligned text result.
 func pptxStrictTextFromFiles(files map[string]*zip.File, names []string) ([]string, error) {
 	var out []string
-	for _, name := range names {
+	for slideIndex, name := range names {
 		f := ooxmlFile(files, name)
 		if f == nil {
 			continue
@@ -1888,7 +2156,7 @@ func pptxStrictTextFromFiles(files map[string]*zip.File, names []string) ([]stri
 		if err != nil {
 			return nil, err
 		}
-		text, err := visiblePptxShapeText(b)
+		text, err := visiblePptxShapeTextWithDynamicFields(b, slideIndex+1, time.Now())
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
@@ -1902,10 +2170,19 @@ func pptxStrictTextFromFiles(files map[string]*zip.File, names []string) ([]stri
 // visiblePptxShapeText follows PowerPoint's visible shape tree. Group members
 // are rendered on the slide and are exposed through the COM GroupItems
 // collection, so their text is part of the Office-aligned strict result. Table
-// cells are likewise cached graphic-frame payloads that are not exposed by
+// cells are cached graphic-frame payloads that are not exposed by
 // Shape.TextFrame after imported HTML is flattened. Non-table graphic frames
 // remain eligible.
 func visiblePptxShapeText(b []byte) (string, error) {
+	return visiblePptxShapeTextWithDynamicFields(b, 0, time.Time{})
+}
+
+// visiblePptxShapeTextWithDynamicFields mirrors PowerPoint's TextRange for
+// date and slide-number fields. PowerPoint recalculates those fields when it
+// opens a presentation, so their cached a:t value can be years out of date.
+// A zero now retains package caches, which keeps this lower-level helper
+// deterministic for compatibility callers and unit tests.
+func visiblePptxShapeTextWithDynamicFields(b []byte, slideNumber int, now time.Time) (string, error) {
 	if hasDOCTYPE(b) {
 		return "", errors.New("xml doctype is not supported")
 	}
@@ -1913,7 +2190,11 @@ func visiblePptxShapeText(b []byte) (string, error) {
 	var out []string
 	var textDepth, mathTextDepth, tableDepth, graphicFrameDepth int
 	var runDepth int
+	var runSymbolFont string
+	var dynamicFieldDepth int
+	var dynamicFieldValue string
 	runHasBaselineOffset := false
+	runHasHyperlink := false
 	lastSegmentHasBaselineOffset := false
 	for {
 		tok, err := dec.Token()
@@ -1930,10 +2211,40 @@ func visiblePptxShapeText(b []byte) (string, error) {
 				runDepth++
 				if runDepth == 1 {
 					runHasBaselineOffset = false
+					runHasHyperlink = false
+					runSymbolFont = ""
+				}
+				if t.Name.Local == "fld" && !now.IsZero() {
+					if value, ok := pptxDynamicFieldValue(xmlAttrValue(t, "type"), slideNumber, now); ok {
+						dynamicFieldDepth++
+						dynamicFieldValue = value
+						appendPptxVisibleTextSegment(&out, value, false, false, false, &lastSegmentHasBaselineOffset)
+					}
 				}
 			case "rPr":
 				if runDepth > 0 && xmlAttrValue(t, "baseline") != "" && xmlAttrValue(t, "baseline") != "0" {
 					runHasBaselineOffset = true
+				}
+				// Some older PowerPoint writers put a:sym directly inside a:rPr,
+				// while others use only the rPr typeface. Keep the latter as the
+				// fallback so U+F0xx values in the following a:t are decoded too.
+				if runDepth > 0 && runSymbolFont == "" {
+					if font := xmlAttrValue(t, "typeface"); isFontEncodedSymbolFont(font) {
+						runSymbolFont = font
+					}
+				}
+			case "hlinkClick", "hlinkMouseOver":
+				if runDepth > 0 {
+					runHasHyperlink = true
+				}
+			case "sym":
+				// DrawingML represents legacy Symbol-font text with a:sym below
+				// a:rPr. Its a:t value can contain U+F0xx private-use fallback
+				// codes (not Unicode arrows). PowerPoint.TextRange renders the
+				// corresponding visible glyph, whose punctuation boundary matters
+				// to strict token comparison.
+				if runDepth > 0 {
+					runSymbolFont = xmlAttrValue(t, "typeface")
 				}
 			case "br":
 				if tableDepth == 0 {
@@ -1966,6 +2277,14 @@ func visiblePptxShapeText(b []byte) (string, error) {
 					runDepth--
 					if runDepth == 0 {
 						runHasBaselineOffset = false
+						runHasHyperlink = false
+						runSymbolFont = ""
+					}
+				}
+				if t.Name.Local == "fld" && dynamicFieldDepth > 0 {
+					dynamicFieldDepth--
+					if dynamicFieldDepth == 0 {
+						dynamicFieldValue = ""
 					}
 				}
 			case "t":
@@ -1984,12 +2303,15 @@ func visiblePptxShapeText(b []byte) (string, error) {
 				}
 			}
 		case xml.CharData:
-			if textDepth > 0 || mathTextDepth > 0 {
+			if (textDepth > 0 || mathTextDepth > 0) && dynamicFieldValue == "" {
 				text := string(t)
 				if mathTextDepth > 0 {
 					text = strings.Map(pptxMathTextRune, text)
 				}
-				appendPptxVisibleTextSegment(&out, text, runHasBaselineOffset, &lastSegmentHasBaselineOffset)
+				if runSymbolFont != "" {
+					text = pptxSymbolFontText(text, runSymbolFont)
+				}
+				appendPptxVisibleTextSegment(&out, text, runHasBaselineOffset, runHasHyperlink, mathTextDepth > 0, &lastSegmentHasBaselineOffset)
 			}
 		}
 	}
@@ -2000,14 +2322,84 @@ func visiblePptxShapeText(b []byte) (string, error) {
 	return cleanTextNoMojibakeRepair(strings.Join(out, "")), nil
 }
 
+func pptxDynamicFieldValue(kind string, slideNumber int, now time.Time) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "slidenum", "slidenumber":
+		if slideNumber <= 0 {
+			return "", false
+		}
+		return strconv.Itoa(slideNumber), true
+	case "datetime1":
+		// PowerPoint's built-in date field uses the host short-date convention,
+		// whose month/day components are not padded on the COM baseline host.
+		return now.Format("1/2/2006"), true
+	case "datetime2":
+		return now.Format("Monday, January 2, 2006"), true
+	case "datetime3":
+		return now.Format("2 January 2006"), true
+	case "datetime4":
+		return now.Format("January 2, 2006"), true
+	case "datetime5":
+		return now.Format("2-Jan-06"), true
+	case "datetime6":
+		return now.Format("January 06"), true
+	case "datetime7":
+		return now.Format("Jan-06"), true
+	case "datetime8":
+		// PowerPoint exposes a locale-expanded datetime8 value. On the
+		// automation host this is short date plus an unpadded 12-hour time,
+		// while Go's reference layout pads minutes. Format components
+		// explicitly to avoid producing 1:01 PM for 13:01.
+		hour := now.Hour() % 12
+		if hour == 0 {
+			hour = 12
+		}
+		ampm := "AM"
+		if now.Hour() >= 12 {
+			ampm = "PM"
+		}
+		return fmt.Sprintf("%d/%d/%04d %d:%02d %s", now.Month(), now.Day(), now.Year(), hour, now.Minute(), ampm), true
+	case "datetime9":
+		return now.Format("1/2/2006"), true
+	case "datetime10":
+		return now.Format("1/2/06"), true
+	case "datetime11":
+		return now.Format("2006-01-02"), true
+	case "datetime12":
+		return now.Format("02-Jan-06"), true
+	case "datetime13":
+		return now.Format("January 2006"), true
+	}
+	return "", false
+}
+
 // appendPptxVisibleTextSegment keeps superscript and subscript runs attached
 // to their mathematical base. PowerPoint's TextRange renders "A" + a raised
 // "2" + "x" as "A2x", while an XML-only run boundary has no implicit space.
-func appendPptxVisibleTextSegment(out *[]string, text string, runHasBaselineOffset bool, lastSegmentHasBaselineOffset *bool) {
+func appendPptxVisibleTextSegment(out *[]string, text string, runHasBaselineOffset, runHasHyperlink, mathText bool, lastSegmentHasBaselineOffset *bool) {
 	if text == "" {
 		return
 	}
-	if !runHasBaselineOffset && !*lastSegmentHasBaselineOffset {
+	// Office Math stores adjacent identifiers in separate m:r nodes. PowerPoint
+	// TextRange exposes their visible mathematical atoms independently, unlike
+	// ordinary DrawingML formatting runs where "Bam" + "HI" is one word. A
+	// boundary here prevents K + m from becoming the invented token Km.
+	if mathText && len(*out) > 0 {
+		// Do not split normal multi-letter mathematical prose ("properties",
+		// "max", "false") merely because it is represented as an m:r. Split
+		// only the atom-sized single-glyph runs that PowerPoint exposes as
+		// separate identifiers/operators through TextRange.
+		previous := (*out)[len(*out)-1]
+		if pptxMathRunIsAtom(previous) && pptxMathRunIsAtom(text) {
+			*out = append(*out, " ")
+		}
+		*out = append(*out, text)
+		*lastSegmentHasBaselineOffset = runHasBaselineOffset
+		return
+	}
+	if runHasHyperlink && len(*out) > 0 && pptxHyperlinkContinuation((*out)[len(*out)-1], text) {
+		*out = append(*out, text)
+	} else if !runHasBaselineOffset && !*lastSegmentHasBaselineOffset {
 		appendPptxOOXMLVisibleTextSegment(out, text)
 	} else {
 		*out = append(*out, text)
@@ -2015,10 +2407,34 @@ func appendPptxVisibleTextSegment(out *[]string, text string, runHasBaselineOffs
 	*lastSegmentHasBaselineOffset = runHasBaselineOffset
 }
 
-func appendPptxOOXMLVisibleTextSegment(out *[]string, text string) {
-	if len(*out) > 0 && pptxTextBoundaryNeedsSpace((*out)[len(*out)-1], text) {
-		*out = append(*out, " ")
+func pptxMathRunIsAtom(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return false
 	}
+	return utf8.RuneCountInString(text) == 1
+}
+
+// pptxHyperlinkContinuation keeps a URL split across identically linked runs
+// intact. PowerPoint's TextRange treats both runs as one hyperlink; inserting
+// a formatting-boundary space would turn a visible URL such as
+// "reciprocitySOUPS" + "11" into two tokens.
+func pptxHyperlinkContinuation(left, right string) bool {
+	leftRunes, rightRunes := []rune(left), []rune(right)
+	if len(leftRunes) == 0 || len(rightRunes) == 0 {
+		return false
+	}
+	return (unicode.IsLetter(leftRunes[len(leftRunes)-1]) || unicode.IsNumber(leftRunes[len(leftRunes)-1])) &&
+		(unicode.IsLetter(rightRunes[0]) || unicode.IsNumber(rightRunes[0]))
+}
+
+func appendPptxOOXMLVisibleTextSegment(out *[]string, text string) {
+	// A DrawingML paragraph is a sequence of text runs.  Run boundaries carry
+	// formatting, not word separators: PowerPoint's TextRange concatenates
+	// "Bam" + "HI" as "BamHI".  Whitespace that is visible in PowerPoint is
+	// encoded in an a:t value and is consequently preserved by appending the
+	// run verbatim.  Adding a heuristic space here splits identifiers whenever a
+	// producer happens to divide a word across otherwise identical runs.
 	*out = append(*out, text)
 }
 
@@ -2049,6 +2465,36 @@ func pptxMathTextRune(r rune) rune {
 		return r & 0xff
 	}
 	return r
+}
+
+// pptxSymbolFontText converts DrawingML's legacy font-encoded run payload to
+// the Unicode glyph PowerPoint exposes through TextRange. A Symbol run may
+// contain a mixture of ordinary punctuation/spacing and U+F0xx fallback
+// codes, so preserve characters the legacy map does not define.
+func pptxSymbolFontText(s, font string) string {
+	if !isFontEncodedSymbolFont(font) {
+		return s
+	}
+	var out strings.Builder
+	for _, r := range s {
+		// PowerPoint preserves ordinary Unicode text in a Symbol-formatted run;
+		// only the private-use fallback byte range is a legacy glyph encoding.
+		// Mapping ASCII here would turn variables such as X/Y/Z into unrelated
+		// Greek letters and corrupt visible formula text. The old report's
+		// remaining mismatch needs a fresh COM probe before widening this rule.
+		if r < 0xf000 || r > 0xf0ff {
+			out.WriteRune(r)
+			continue
+		}
+		code := r
+		code &= 0xff
+		if mapped, ok := fontEncodedSymbolRune(font, code); ok {
+			out.WriteRune(mapped)
+			continue
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
 }
 
 func extractPptxMarkdown(files map[string]*zip.File) (string, error) {
@@ -2605,10 +3051,24 @@ func pptxPresentationSlideNames(files map[string]*zip.File) ([]string, bool, err
 		seen[lower] = true
 		names = append(names, part)
 	}
+	// presentation.xml's slide-id relationship list is authoritative. A
+	// numerically adjacent part without a relationship is still an orphan and
+	// must not leak text, notes, comments, or pictures into output. If that
+	// relationship list is unusable, pptxCandidateSlideNames falls back to all
+	// slide parts instead of guessing extra slides from their filenames.
 	if len(names) == 0 {
 		return nil, false, nil
 	}
 	return names, true, nil
+}
+
+func pptxSlidePartNumber(name string) (int, bool) {
+	match := regexp.MustCompile(`(?i)^ppt/slides/slide([0-9]+)\.xml$`).FindStringSubmatch(ooxmlPartKey(name))
+	if len(match) != 2 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(match[1])
+	return n, err == nil && n > 0
 }
 
 func pptxPresentationSlideRelationshipIDs(b []byte) ([]string, error) {
@@ -2988,6 +3448,14 @@ func extractXlsxText(files map[string]*zip.File, strictOfficeContent bool) (stri
 		}
 		markdown[ooxmlPartKey(name)] = md
 	}
+	if strictOfficeContent {
+		// A strict Excel baseline is Worksheet.UsedRange.Text plus Picture
+		// shapes.  Text in drawing, VML, chart, comments, pivot and other
+		// auxiliary parts is not Range.Text.  In particular VML Pict controls
+		// can contain hundreds of image relationships but no worksheet cells;
+		// broad OOXML cleanup must never revive their XML tokens as visible text.
+		return strings.TrimSpace(out.String()), markdown, nil
+	}
 	if !strictOfficeContent && xlsxHasAnyPartPrefix(files, []string{"xl/charts/", "xl/drawings/", "xl/tables/", "xl/pivottables/", "xl/pivotcache/", "xl/slicers/", "xl/slicercaches/"}) {
 		var extraNames []string
 		visibleDrawingParts := xlsxVisibleDrawingPartNames(files)
@@ -3104,6 +3572,192 @@ func xlsxVisibleChartPartNamesUncached(files map[string]*zip.File) (map[string]b
 	return visible, true
 }
 
+// docxOLEPreviewShapeIDs identifies VML ShapeIDs that belong to embedded OLE
+// objects.  Their imagedata payload is a preview cache, whereas Word exposes
+// the containing object as msoEmbeddedOLEObject rather than as a Picture Shape.
+func docxOLEPreviewShapeIDs(b []byte) (map[string]bool, error) {
+	ids := map[string]bool{}
+	if hasDOCTYPE(b) {
+		return ids, errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return ids, nil
+		}
+		if err != nil {
+			return ids, err
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok || start.Name.Local != "OLEObject" {
+			continue
+		}
+		if id := normalizeVMLShapeID(xmlAttrValue(start, "ShapeID")); id != "" {
+			ids[id] = true
+		}
+	}
+}
+
+// docxVMLShapeIDsWithEmbeddedObjectData returns VML shapes that carry an
+// Office embedded-object relationship in the same w:pict container.  Office
+// exposes those as OLE objects (with a preview), not as Picture Shapes.
+func docxVMLShapeIDsWithEmbeddedObjectData(b []byte) (map[string]bool, error) {
+	ids := map[string]bool{}
+	if hasDOCTYPE(b) {
+		return ids, errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	pictDepth := 0
+	var shapeStack []string
+	var pictShapeIDs []string
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return ids, nil
+		}
+		if err != nil {
+			return ids, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "pict" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml") {
+				pictDepth++
+				if pictDepth == 1 {
+					pictShapeIDs = nil
+				}
+			}
+			if t.Name.Local == "shape" && strings.Contains(strings.ToLower(t.Name.Space), "vml") {
+				id := normalizeVMLShapeID(xmlAttrValue(t, "id"))
+				shapeStack = append(shapeStack, id)
+				if pictDepth > 0 && id != "" {
+					pictShapeIDs = append(pictShapeIDs, id)
+				}
+			}
+			if pictDepth > 0 && t.Name.Local == "OLEObject" {
+				for _, id := range pictShapeIDs {
+					ids[id] = true
+				}
+			}
+		case xml.EndElement:
+			if t.Name.Local == "shape" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && len(shapeStack) > 0 {
+				shapeStack = shapeStack[:len(shapeStack)-1]
+			}
+			if t.Name.Local == "pict" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml") && pictDepth > 0 {
+				pictDepth--
+				if pictDepth == 0 {
+					pictShapeIDs = nil
+				}
+			}
+		}
+	}
+}
+
+// docxSVGPictureRelationshipIDs returns all bitmap fallback and SVG payload
+// relationships belonging to a DrawingML picture with an Office SVG blip.
+// Word exposes this legacy SVG construct as a non-picture InlineShape on the
+// current COM surface, so neither payload belongs in the strict Picture count.
+func docxSVGPictureRelationshipIDs(b []byte) (map[string]bool, error) {
+	ids := map[string]bool{}
+	if hasDOCTYPE(b) {
+		return ids, errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	pictureDepth := 0
+	var pictureIDs [][]string
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return ids, nil
+		}
+		if err != nil {
+			return ids, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "pic" && strings.Contains(strings.ToLower(t.Name.Space), "picture") {
+				pictureDepth++
+				pictureIDs = append(pictureIDs, nil)
+			}
+			if pictureDepth == 0 {
+				continue
+			}
+			values := imageRelationshipIDs(t)
+			if len(values) > 0 {
+				pictureIDs[len(pictureIDs)-1] = append(pictureIDs[len(pictureIDs)-1], values...)
+			}
+			if t.Name.Local == "svgBlip" {
+				for _, id := range pictureIDs[len(pictureIDs)-1] {
+					ids[id] = true
+				}
+			}
+		case xml.EndElement:
+			if t.Name.Local == "pic" && strings.Contains(strings.ToLower(t.Name.Space), "picture") && pictureDepth > 0 {
+				pictureDepth--
+				pictureIDs = pictureIDs[:len(pictureIDs)-1]
+			}
+		}
+	}
+}
+
+// docxVMLPictureRelationshipIDs reports VML picture payloads while excluding
+// the preview media Word assigns to chart/diagram placeholder groups.  Both
+// use v:shape type #_x0000_t75, but only the former is named as a Picture in
+// Word's Shapes/GroupItems collection; producer-generated Chart/Object names
+// are msoChart/msoEmbeddedOLEObject and must not inflate picture counts.
+func docxVMLPictureRelationshipIDs(b []byte) (map[string]bool, error) {
+	ids := map[string]bool{}
+	if hasDOCTYPE(b) {
+		return ids, errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	type vmlShapeState struct {
+		isPicture bool
+		ids       []string
+	}
+	var shapes []vmlShapeState
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return ids, nil
+		}
+		if err != nil {
+			return ids, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "shape" && strings.Contains(strings.ToLower(t.Name.Space), "vml") {
+				name := strings.ToLower(strings.TrimSpace(xmlAttrValue(t, "id")))
+				shapeType := strings.ToLower(strings.TrimSpace(xmlAttrValue(t, "type")))
+				// Word's VML shape name identifies its COM Shape type more reliably
+				// than the shared t75 geometry. Names beginning "Object" are
+				// embedded OLE/package placeholders (not msoPicture) even though
+				// they carry visible imagedata; names such as "Picture 1" are the
+				// actual Word Picture Shapes.
+				isObjectPlaceholder := strings.HasPrefix(name, "object")
+				isPicture := strings.Contains(shapeType, "_x0000_t75") && !isObjectPlaceholder && !strings.Contains(name, "chart") && !strings.Contains(name, "placeholder")
+				shapes = append(shapes, vmlShapeState{isPicture: isPicture})
+				continue
+			}
+			if t.Name.Local == "imagedata" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && len(shapes) > 0 {
+				// A VML group is not on this stack, so the most recent VML shape
+				// remains the shape that owns this imagedata element.
+				shapes[len(shapes)-1].ids = append(shapes[len(shapes)-1].ids, imageRelationshipIDs(t)...)
+			}
+		case xml.EndElement:
+			if t.Name.Local == "shape" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && len(shapes) > 0 {
+				shape := shapes[len(shapes)-1]
+				shapes = shapes[:len(shapes)-1]
+				if shape.isPicture {
+					for _, id := range shape.ids {
+						ids[id] = true
+					}
+				}
+			}
+		}
+	}
+}
+
 // docxStrictPictureRelationshipRefs mirrors Word's InlineShapes and Shapes
 // collections: a relationship counts only when it belongs to a DrawingML
 // picture (pic:pic) or a VML image element. Image fills, diagrams, and other
@@ -3114,10 +3768,38 @@ func docxStrictPictureRelationshipRefs(b []byte) (docxImageRefs, error) {
 	if hasDOCTYPE(b) {
 		return refs, errors.New("xml doctype is not supported")
 	}
+	olePreviewShapes, err := docxOLEPreviewShapeIDs(b)
+	if err != nil {
+		return refs, err
+	}
+	embeddedObjectShapes, err := docxVMLShapeIDsWithEmbeddedObjectData(b)
+	if err != nil {
+		return refs, err
+	}
+	for id := range embeddedObjectShapes {
+		olePreviewShapes[id] = true
+	}
+	svgPictureIDs, err := docxSVGPictureRelationshipIDs(b)
+	if err != nil {
+		return refs, err
+	}
+	vmlPictureIDs, err := docxVMLPictureRelationshipIDs(b)
+	if err != nil {
+		return refs, err
+	}
 	dec := xml.NewDecoder(bytes.NewReader(b))
 	pictureDepth := 0
 	vmlImageDepth := 0
 	objectDepth := 0
+	anchorDepth := 0
+	textBoxDepth := 0
+	wordProcessingGroupDepth := 0
+	var vmlSuppressImages []bool
+	vmlShapeDepth := 0
+	vmlShapeID := ""
+	var vmlShapeIDs []string
+	var alternateStack []alternateContentState
+	fallbackDepth := 0
 	for {
 		token, err := dec.Token()
 		if err == io.EOF {
@@ -3128,8 +3810,38 @@ func docxStrictPictureRelationshipRefs(b []byte) (docxImageRefs, error) {
 		}
 		switch t := token.(type) {
 		case xml.StartElement:
+			if t.Name.Local == "AlternateContent" {
+				alternateStack = append(alternateStack, alternateContentState{})
+				continue
+			}
+			if len(alternateStack) > 0 {
+				top := &alternateStack[len(alternateStack)-1]
+				switch t.Name.Local {
+				case "Choice":
+					top.choiceSeen = true
+				case "Fallback":
+					if top.choiceSeen {
+						fallbackDepth++
+					}
+				}
+			}
 			if t.Name.Local == "object" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml") {
 				objectDepth++
+			}
+			if t.Name.Local == "anchor" && strings.Contains(strings.ToLower(t.Name.Space), "drawingml") {
+				anchorDepth++
+				if len(alternateStack) > 0 {
+					alternateStack[len(alternateStack)-1].choiceHasAnchor = true
+				}
+			}
+			if (t.Name.Local == "txbxContent" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml")) || (t.Name.Local == "textbox" && strings.Contains(strings.ToLower(t.Name.Space), "vml")) {
+				textBoxDepth++
+			}
+			if t.Name.Local == "wgp" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessinggroup") {
+				wordProcessingGroupDepth++
+			}
+			if t.Name.Local == "group" && strings.Contains(strings.ToLower(t.Name.Space), "vml") {
+				vmlSuppressImages = append(vmlSuppressImages, docxVMLFloatingCanvasGroup(t))
 			}
 			if t.Name.Local == "pic" && strings.Contains(strings.ToLower(t.Name.Space), "picture") {
 				pictureDepth++
@@ -3137,20 +3849,86 @@ func docxStrictPictureRelationshipRefs(b []byte) (docxImageRefs, error) {
 			if t.Name.Local == "imagedata" && strings.Contains(strings.ToLower(t.Name.Space), "vml") {
 				vmlImageDepth++
 			}
-			if objectDepth == 0 && (pictureDepth > 0 || vmlImageDepth > 0) {
+			if t.Name.Local == "shape" && strings.Contains(strings.ToLower(t.Name.Space), "vml") {
+				vmlShapeIDs = append(vmlShapeIDs, normalizeVMLShapeID(xmlAttrValue(t, "id")))
+				vmlShapeDepth++
+			}
+			vmlShapeID = ""
+			if len(vmlShapeIDs) > 0 {
+				vmlShapeID = vmlShapeIDs[len(vmlShapeIDs)-1]
+			}
+			isOLEPreview := vmlImageDepth > 0 && olePreviewShapes[vmlShapeID]
+			vmlSuppressed := false
+			for _, suppress := range vmlSuppressImages {
+				if suppress {
+					vmlSuppressed = true
+					break
+				}
+			}
+			// A legacy VML group may be stored inside w:object while Word still
+			// exposes its picture children through Shape.GroupItems.  Keep the
+			// w:object exclusion for DrawingML pictures (where it represents an
+			// embedded-object preview), but admit VML relationships that have
+			// already been classified as actual VML picture shapes.
+			isDrawingMLPicture := pictureDepth > 0
+			isVMLPicture := vmlImageDepth > 0
+			allowedObjectContext := (isDrawingMLPicture && objectDepth == 0) || isVMLPicture
+			// Word exposes DrawingML pictures nested in a legacy VML text box
+			// through InlineShapes; VML imagedata in that same box is merely a
+			// fill/preview and stays excluded.
+			allowedTextBoxContext := textBoxDepth == 0 || isDrawingMLPicture
+			// Word still exposes legacy VML pictures in mc:Fallback (it uses that
+			// representation for these legacy groups), whereas DrawingML fallback
+			// would be a duplicate of the selected Choice and must stay hidden.
+			// A floating WPG group is exposed by Word as a Shape and exposes
+			// its VML fallback members as GroupItems. An inline WPG group is
+			// not exposed that way, so its fallback must remain suppressed.
+			choiceHasAnchor := len(alternateStack) > 0 && alternateStack[len(alternateStack)-1].choiceHasAnchor
+			allowedAlternateContent := fallbackDepth == 0 || (isVMLPicture && choiceHasAnchor)
+			if allowedAlternateContent && allowedObjectContext && allowedTextBoxContext && wordProcessingGroupDepth == 0 && !vmlSuppressed && !isOLEPreview && (isDrawingMLPicture || isVMLPicture) {
 				for _, id := range imageRelationshipIDs(t) {
-					refs.Visible[id] = true
+					if !svgPictureIDs[id] && (isDrawingMLPicture || vmlPictureIDs[id]) {
+						refs.Visible[id] = true
+					}
 				}
 			}
 		case xml.EndElement:
+			if t.Name.Local == "Fallback" && fallbackDepth > 0 {
+				fallbackDepth--
+			}
+			if t.Name.Local == "AlternateContent" && len(alternateStack) > 0 {
+				alternateStack = alternateStack[:len(alternateStack)-1]
+			}
 			if t.Name.Local == "object" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml") && objectDepth > 0 {
 				objectDepth--
+			}
+			if t.Name.Local == "anchor" && strings.Contains(strings.ToLower(t.Name.Space), "drawingml") && anchorDepth > 0 {
+				anchorDepth--
+			}
+			if ((t.Name.Local == "txbxContent" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml")) || (t.Name.Local == "textbox" && strings.Contains(strings.ToLower(t.Name.Space), "vml"))) && textBoxDepth > 0 {
+				textBoxDepth--
+			}
+			if t.Name.Local == "wgp" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessinggroup") && wordProcessingGroupDepth > 0 {
+				wordProcessingGroupDepth--
+			}
+			if t.Name.Local == "group" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && len(vmlSuppressImages) > 0 {
+				vmlSuppressImages = vmlSuppressImages[:len(vmlSuppressImages)-1]
 			}
 			if t.Name.Local == "pic" && strings.Contains(strings.ToLower(t.Name.Space), "picture") && pictureDepth > 0 {
 				pictureDepth--
 			}
 			if t.Name.Local == "imagedata" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && vmlImageDepth > 0 {
 				vmlImageDepth--
+			}
+			if t.Name.Local == "shape" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && vmlShapeDepth > 0 {
+				vmlShapeDepth--
+				if len(vmlShapeIDs) > 0 {
+					vmlShapeIDs = vmlShapeIDs[:len(vmlShapeIDs)-1]
+				}
+				vmlShapeID = ""
+				if len(vmlShapeIDs) > 0 {
+					vmlShapeID = vmlShapeIDs[len(vmlShapeIDs)-1]
+				}
 			}
 		}
 	}
@@ -3164,10 +3942,38 @@ func docxStrictPictureRelationshipIDsInOrder(b []byte) ([]string, error) {
 	if hasDOCTYPE(b) {
 		return nil, errors.New("xml doctype is not supported")
 	}
+	olePreviewShapes, err := docxOLEPreviewShapeIDs(b)
+	if err != nil {
+		return nil, err
+	}
+	embeddedObjectShapes, err := docxVMLShapeIDsWithEmbeddedObjectData(b)
+	if err != nil {
+		return nil, err
+	}
+	for id := range embeddedObjectShapes {
+		olePreviewShapes[id] = true
+	}
+	svgPictureIDs, err := docxSVGPictureRelationshipIDs(b)
+	if err != nil {
+		return nil, err
+	}
+	vmlPictureIDs, err := docxVMLPictureRelationshipIDs(b)
+	if err != nil {
+		return nil, err
+	}
 	dec := xml.NewDecoder(bytes.NewReader(b))
 	pictureDepth := 0
 	vmlImageDepth := 0
 	objectDepth := 0
+	anchorDepth := 0
+	textBoxDepth := 0
+	wordProcessingGroupDepth := 0
+	var vmlSuppressImages []bool
+	vmlShapeDepth := 0
+	vmlShapeID := ""
+	var vmlShapeIDs []string
+	var alternateStack []alternateContentState
+	fallbackDepth := 0
 	var ids []string
 	for {
 		token, err := dec.Token()
@@ -3179,8 +3985,38 @@ func docxStrictPictureRelationshipIDsInOrder(b []byte) ([]string, error) {
 		}
 		switch t := token.(type) {
 		case xml.StartElement:
+			if t.Name.Local == "AlternateContent" {
+				alternateStack = append(alternateStack, alternateContentState{})
+				continue
+			}
+			if len(alternateStack) > 0 {
+				top := &alternateStack[len(alternateStack)-1]
+				switch t.Name.Local {
+				case "Choice":
+					top.choiceSeen = true
+				case "Fallback":
+					if top.choiceSeen {
+						fallbackDepth++
+					}
+				}
+			}
 			if t.Name.Local == "object" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml") {
 				objectDepth++
+			}
+			if t.Name.Local == "anchor" && strings.Contains(strings.ToLower(t.Name.Space), "drawingml") {
+				anchorDepth++
+				if len(alternateStack) > 0 {
+					alternateStack[len(alternateStack)-1].choiceHasAnchor = true
+				}
+			}
+			if (t.Name.Local == "txbxContent" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml")) || (t.Name.Local == "textbox" && strings.Contains(strings.ToLower(t.Name.Space), "vml")) {
+				textBoxDepth++
+			}
+			if t.Name.Local == "wgp" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessinggroup") {
+				wordProcessingGroupDepth++
+			}
+			if t.Name.Local == "group" && strings.Contains(strings.ToLower(t.Name.Space), "vml") {
+				vmlSuppressImages = append(vmlSuppressImages, docxVMLFloatingCanvasGroup(t))
 			}
 			if t.Name.Local == "pic" && strings.Contains(strings.ToLower(t.Name.Space), "picture") {
 				pictureDepth++
@@ -3188,12 +4024,62 @@ func docxStrictPictureRelationshipIDsInOrder(b []byte) ([]string, error) {
 			if t.Name.Local == "imagedata" && strings.Contains(strings.ToLower(t.Name.Space), "vml") {
 				vmlImageDepth++
 			}
-			if objectDepth == 0 && (pictureDepth > 0 || vmlImageDepth > 0) {
-				ids = append(ids, imageRelationshipIDs(t)...)
+			if t.Name.Local == "shape" && strings.Contains(strings.ToLower(t.Name.Space), "vml") {
+				vmlShapeIDs = append(vmlShapeIDs, normalizeVMLShapeID(xmlAttrValue(t, "id")))
+				vmlShapeDepth++
+			}
+			vmlShapeID = ""
+			if len(vmlShapeIDs) > 0 {
+				vmlShapeID = vmlShapeIDs[len(vmlShapeIDs)-1]
+			}
+			isOLEPreview := vmlImageDepth > 0 && olePreviewShapes[vmlShapeID]
+			vmlSuppressed := false
+			for _, suppress := range vmlSuppressImages {
+				if suppress {
+					vmlSuppressed = true
+					break
+				}
+			}
+			// Keep this occurrence-preserving path in lockstep with
+			// docxStrictPictureRelationshipRefs; see its comment for why VML
+			// GroupItems in w:object remain visible to Word.
+			isDrawingMLPicture := pictureDepth > 0
+			isVMLPicture := vmlImageDepth > 0
+			allowedObjectContext := (isDrawingMLPicture && objectDepth == 0) || isVMLPicture
+			allowedTextBoxContext := textBoxDepth == 0 || isDrawingMLPicture
+			// See docxStrictPictureRelationshipRefs: a VML fallback is the
+			// Word-visible legacy representation, unlike a DrawingML fallback.
+			choiceHasAnchor := len(alternateStack) > 0 && alternateStack[len(alternateStack)-1].choiceHasAnchor
+			allowedAlternateContent := fallbackDepth == 0 || (isVMLPicture && choiceHasAnchor)
+			if allowedAlternateContent && allowedObjectContext && allowedTextBoxContext && wordProcessingGroupDepth == 0 && !vmlSuppressed && !isOLEPreview && (isDrawingMLPicture || isVMLPicture) {
+				values := imageRelationshipIDs(t)
+				for _, id := range values {
+					if !svgPictureIDs[id] && (isDrawingMLPicture || vmlPictureIDs[id]) {
+						ids = append(ids, id)
+					}
+				}
 			}
 		case xml.EndElement:
+			if t.Name.Local == "Fallback" && fallbackDepth > 0 {
+				fallbackDepth--
+			}
+			if t.Name.Local == "AlternateContent" && len(alternateStack) > 0 {
+				alternateStack = alternateStack[:len(alternateStack)-1]
+			}
 			if t.Name.Local == "object" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml") && objectDepth > 0 {
 				objectDepth--
+			}
+			if t.Name.Local == "anchor" && strings.Contains(strings.ToLower(t.Name.Space), "drawingml") && anchorDepth > 0 {
+				anchorDepth--
+			}
+			if ((t.Name.Local == "txbxContent" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessingml")) || (t.Name.Local == "textbox" && strings.Contains(strings.ToLower(t.Name.Space), "vml"))) && textBoxDepth > 0 {
+				textBoxDepth--
+			}
+			if t.Name.Local == "wgp" && strings.Contains(strings.ToLower(t.Name.Space), "wordprocessinggroup") && wordProcessingGroupDepth > 0 {
+				wordProcessingGroupDepth--
+			}
+			if t.Name.Local == "group" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && len(vmlSuppressImages) > 0 {
+				vmlSuppressImages = vmlSuppressImages[:len(vmlSuppressImages)-1]
 			}
 			if t.Name.Local == "pic" && strings.Contains(strings.ToLower(t.Name.Space), "picture") && pictureDepth > 0 {
 				pictureDepth--
@@ -3201,8 +4087,27 @@ func docxStrictPictureRelationshipIDsInOrder(b []byte) ([]string, error) {
 			if t.Name.Local == "imagedata" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && vmlImageDepth > 0 {
 				vmlImageDepth--
 			}
+			if t.Name.Local == "shape" && strings.Contains(strings.ToLower(t.Name.Space), "vml") && vmlShapeDepth > 0 {
+				vmlShapeDepth--
+				if len(vmlShapeIDs) > 0 {
+					vmlShapeIDs = vmlShapeIDs[:len(vmlShapeIDs)-1]
+				}
+				vmlShapeID = ""
+				if len(vmlShapeIDs) > 0 {
+					vmlShapeID = vmlShapeIDs[len(vmlShapeIDs)-1]
+				}
+			}
 		}
 	}
+}
+
+// docxVMLFloatingCanvasGroup identifies a VML canvas whose direct image
+// children Word exposes only through the canvas, not as Picture Shapes.
+// The suppression is deliberately local to that group: images in a nested
+// ordinary VML group remain separate GroupItems, even when that group itself
+// is contained by a canvas.
+func docxVMLFloatingCanvasGroup(start xml.StartElement) bool {
+	return strings.EqualFold(strings.TrimSpace(xmlAttrValue(start, "editas")), "canvas")
 }
 
 func collectXlsxSourceVisibleChartParts(files map[string]*zip.File, source string, visible, hidden, seen map[string]bool) (bool, bool) {
@@ -4857,16 +5762,26 @@ func workbookTextAndSheets(files map[string]*zip.File, strictOfficeContent bool)
 					}
 				}
 				if !hidden {
-					if sheetName != "" {
-						out = append(out, sheetName)
-					}
 					if hasRels {
 						target := rels[relID]
 						if actual := ooxmlPartName(files, target); actual != "" {
+							// Excel.Worksheets, which is the strict COM baseline,
+							// excludes chart sheets. Their cached series values live
+							// in chartsheet XML but are not Worksheet.UsedRange.Text.
+							if strictOfficeContent && !strings.HasPrefix(ooxmlPartKey(actual), "xl/worksheets/") {
+								sheetIndex++
+								break
+							}
+							if sheetName != "" {
+								out = append(out, sheetName)
+							}
 							sheets = append(sheets, actual)
 							sheetIndex++
 							break
 						}
+					}
+					if sheetName != "" {
+						out = append(out, sheetName)
 					}
 					if len(fallbackParts) > sheetIndex {
 						sheets = append(sheets, fallbackParts[sheetIndex])
@@ -6338,7 +7253,8 @@ func intAttrValue(start xml.StartElement, name string) (int, bool) {
 }
 
 type alternateContentState struct {
-	choiceSeen bool
+	choiceSeen      bool
+	choiceHasAnchor bool
 }
 
 func alternateContentStartSkip(name string, stack *[]alternateContentState) bool {
@@ -6798,6 +7714,20 @@ func visibleSymbolText(start xml.StartElement) (string, bool) {
 	return "", false
 }
 
+// visibleWordSymbolTextAt implements the narrower behavior of
+// Word.Document.Content.Text for w:sym. In particular, when Word opens the
+// Open XML SDK's legacy Symbol-font glyph fields it exposes the fallback
+// parenthesis, rather than the Unicode glyph suggested by the encoded code.
+// Keep the general extractor's useful Unicode mapping in visibleSymbolText;
+// this variant is only for the strict Office-visible comparator.
+func visibleWordSymbolTextAt(start xml.StartElement) (string, bool) {
+	font := strings.ToLower(strings.TrimSpace(xmlAttrValue(start, "font")))
+	if isFontEncodedSymbolFont(font) {
+		return "(", true
+	}
+	return visibleSymbolText(start)
+}
+
 func xmlAttrValue(start xml.StartElement, name string) string {
 	for _, attr := range start.Attr {
 		if attr.Name.Local == name {
@@ -6863,6 +7793,7 @@ func isFontEncodedSymbolFont(font string) bool {
 }
 
 func fontEncodedSymbolRune(font string, code rune) (rune, bool) {
+	font = strings.ToLower(strings.TrimSpace(font))
 	switch {
 	case strings.Contains(font, "webdings"):
 		// Word exposes these Webdings glyphs as parentheses in TextRange.Text.
@@ -6889,6 +7820,10 @@ func fontEncodedSymbolRune(font string, code rune) (rune, bool) {
 		}
 	case strings.Contains(font, "symbol"):
 		switch code {
+		case 0xae:
+			// PowerPoint's legacy Symbol-font right-arrow fallback is commonly
+			// serialized as U+F0AE in DrawingML a:t.
+			return '\u2192', true
 		case 0x41:
 			return '\u0391', true
 		case 0x42:
@@ -9188,20 +10123,235 @@ func xlsxDisplayNumber(value, style string, formats map[string]string) string {
 	if err != nil {
 		return value
 	}
-	// General formats (built-in 0 and the custom General used by several
-	// writers) suppress floating-point storage residue in Excel's .Text.
-	if style == "0" || style == "82" {
-		return strconv.FormatFloat(n, 'g', 14, 64)
-	}
-	if displayed, ok := xlsxDisplayBuiltInNumber(n, style); ok {
-		return displayed
-	}
+	// Custom formats are allowed to use the built-in date/time format IDs.
+	// The previous order only applied built-ins to IDs below 164, so a writer
+	// that defines numFmtId=178 with formatCode="d" leaked the stored Excel
+	// serial (40547) instead of Range.Text's day of month (12).  Consult an
+	// authored format first; this also preserves locale-qualified custom dates.
 	if format, ok := formats[style]; ok {
+		if displayed, ok := xlsxDisplayCustomTimeNumber(n, format); ok {
+			return displayed
+		}
+		if displayed, ok := xlsxDisplayCustomDateNumber(n, format); ok {
+			return displayed
+		}
 		if displayed, ok := xlsxDisplayCustomNumber(n, format); ok {
 			return displayed
 		}
 	}
+	// General formats (built-in 0 and the custom General used by several
+	// writers) suppress floating-point storage residue in Excel's .Text. An
+	// authored formatCode always wins, including the legitimate custom
+	// numFmtId=0 seen in files produced by older spreadsheet writers.
+	if style == "0" || style == "82" {
+		// Excel's General format uses at most eleven significant digits in a
+		// normally sized cell. Fourteen digits preserve binary storage residue
+		// (142.85714285714) that Range.Text renders as 142.857143. Fixed-point
+		// is important here: Go's 'g' switches 120 to 1.2e+02, while Excel keeps
+		// normal-sized General values in decimal notation.
+		return xlsxGeneralDisplayNumber(n)
+	}
+	if displayed, ok := xlsxDisplayBuiltInNumber(n, style); ok {
+		return displayed
+	}
 	return value
+}
+
+// xlsxDisplayCustomTimeNumber handles the straightforward clock and elapsed
+// time patterns emitted in styles.xml.  These do not contain d/m/y, so date
+// formatting cannot help; returning their stored fractional-day value makes a
+// strict Excel UsedRange.Text comparison lose most tokens in time-series
+// workbooks.
+func xlsxDisplayCustomTimeNumber(n float64, format string) (string, bool) {
+	clean := strings.ToLower(format)
+	clean = regexp.MustCompile(`"[^"]*"|\\.|;.*`).ReplaceAllString(clean, "")
+	// An elapsed-minutes format such as [mm]:ss has no hour placeholder.
+	// Treat it as time before the date formatter sees the m tokens and renders
+	// the serial as a calendar month.  This is common in timing worksheets.
+	elapsedMinutes := strings.Contains(clean, "[m]") || strings.Contains(clean, "[mm]")
+	if (!strings.Contains(clean, "h") || !strings.Contains(clean, "m")) && !elapsedMinutes {
+		return "", false
+	}
+	if strings.ContainsAny(clean, "dy") {
+		return "", false
+	}
+	negative := n < 0
+	if negative {
+		n = -n
+	}
+	// Excel rounds a serial to the nearest displayed second for normal clock
+	// formats. This also compensates for the recurring sub-second residue in
+	// cached OOXML doubles (for example, a stored 0:49:59.999... is 0:50:00).
+	seconds := int(math.Floor(n*86400 + 0.5))
+	elapsed := strings.Contains(clean, "[h]")
+	if elapsedMinutes {
+		minutes := seconds / 60
+		out := fmt.Sprintf("%02d:%02d", minutes, seconds%60)
+		if negative {
+			out = "-" + out
+		}
+		return out, true
+	}
+	hours := seconds / 3600
+	if !elapsed {
+		hours %= 24
+	}
+	minutes := (seconds / 60) % 60
+	secs := seconds % 60
+	var out string
+	if strings.Contains(clean, "hh") {
+		out = fmt.Sprintf("%02d:%02d", hours, minutes)
+	} else {
+		out = fmt.Sprintf("%d:%02d", hours, minutes)
+	}
+	if strings.Contains(clean, "ss") {
+		out += fmt.Sprintf(":%02d", secs)
+	}
+	if strings.Contains(clean, "am/pm") {
+		ampm := "AM"
+		if hours >= 12 {
+			ampm = "PM"
+		}
+		hours %= 12
+		if hours == 0 {
+			hours = 12
+		}
+		if strings.Contains(clean, "hh") {
+			out = fmt.Sprintf("%02d:%02d", hours, minutes)
+		} else {
+			out = fmt.Sprintf("%d:%02d", hours, minutes)
+		}
+		if strings.Contains(clean, "ss") {
+			out += fmt.Sprintf(":%02d", secs)
+		}
+		out += " " + ampm
+	}
+	if negative {
+		out = "-" + out
+	}
+	return out, true
+}
+
+func xlsxGeneralDisplayNumber(n float64) string {
+	if n == 0 {
+		return "0"
+	}
+	abs := math.Abs(n)
+	if abs >= 1e11 || abs < 1e-9 {
+		return strings.ReplaceAll(strconv.FormatFloat(n, 'e', 10, 64), "e", "E")
+	}
+	digitsBefore := 1
+	if abs >= 1 {
+		digitsBefore = int(math.Floor(math.Log10(abs))) + 1
+	}
+	decimals := 11 - digitsBefore
+	if decimals < 0 {
+		decimals = 0
+	}
+	return strings.TrimRight(strings.TrimRight(strconv.FormatFloat(xlsxRoundDisplayNumber(n, decimals), 'f', decimals, 64), "0"), ".")
+}
+
+// xlsxDisplayCustomDateNumber implements the common custom date forms used
+// by workbook producers. Without it a stored serial such as 41014 leaks into
+// strict extraction while Excel's Range.Text shows "18-Apr-12".
+func xlsxDisplayCustomDateNumber(n float64, format string) (string, bool) {
+	clean := strings.ToLower(format)
+	clean = regexp.MustCompile(`"[^"]*"|\\.|\[[^\]]*\]|;.*`).ReplaceAllString(clean, "")
+	// A date format can legitimately contain only a day ("d") or only a
+	// month/year component.  Requiring both d and m let custom format IDs such
+	// as 178="d" leak the serial number while Excel displayed the day.
+	if !strings.ContainsAny(clean, "dmy") || n < 0 || n > 2958465 {
+		return "", false
+	}
+	days := int(math.Floor(n))
+	base := time.Date(1899, time.December, 31, 0, 0, 0, 0, time.UTC)
+	// Preserve Excel's intentionally incorrect 1900 leap-year convention.
+	if days >= 60 {
+		days--
+	}
+	d := base.AddDate(0, 0, days)
+	// A common Office-generated locale format is [$-1409]d\ mmmm\ yyyy.
+	// Its escaped spaces are visible separators; the generic formatter below
+	// historically replaced them with hyphens, producing a token mismatch
+	// against Excel Range.Text ("1 January 2024").
+	if strings.Contains(strings.ToLower(format), "d\\ mmmm\\ yyyy") {
+		return d.Format("2 January 2006"), true
+	}
+	// Weekday-bearing custom formats are not represented by the built-in date
+	// IDs. In particular, formats such as ddd\-dd\-mmm\-yy are common in
+	// Office-authored schedule templates and Range.Text includes the weekday.
+	if strings.Contains(clean, "ddd") {
+		sep := "-"
+		if strings.Contains(clean, "ddd/") {
+			sep = "/"
+		}
+		day := strconv.Itoa(d.Day())
+		if strings.Contains(clean, "dd") {
+			day = fmt.Sprintf("%02d", d.Day())
+		}
+		month := d.Format("Jan")
+		if strings.Contains(clean, "mmmm") {
+			month = d.Month().String()
+		}
+		year := d.Format("06")
+		if strings.Contains(clean, "yyyy") {
+			year = d.Format("2006")
+		}
+		return d.Format("Mon") + sep + day + sep + month + sep + year, true
+	}
+	// Numeric month/day/year forms are common in older workbooks.  They need
+	// their own branch because the generic date formatter below intentionally
+	// uses a slash-delimited dd/mm layout for ambiguous formats; Excel's
+	// m/d/yy format displays 4/9/76, not 09/04/76.
+	if strings.Contains(clean, "m/d/") || strings.Contains(clean, "m-d-") {
+		sep := "/"
+		if strings.Contains(clean, "m-d-") {
+			sep = "-"
+		}
+		month := strconv.Itoa(int(d.Month()))
+		day := strconv.Itoa(d.Day())
+		if strings.Contains(clean, "mm") {
+			month = fmt.Sprintf("%02d", int(d.Month()))
+		}
+		if strings.Contains(clean, "dd") {
+			day = fmt.Sprintf("%02d", d.Day())
+		}
+		year := d.Format("06")
+		if strings.Contains(clean, "yyyy") {
+			year = d.Format("2006")
+		}
+		return month + sep + day + sep + year, true
+	}
+	switch {
+	case strings.Contains(clean, "d") && !strings.ContainsAny(clean, "my"):
+		return strconv.Itoa(d.Day()), true
+	case strings.Contains(clean, "m") && !strings.Contains(clean, "d"):
+		if strings.Contains(clean, "mmmm") {
+			return d.Month().String(), true
+		}
+		if strings.Contains(clean, "mmm") {
+			return d.Format("Jan"), true
+		}
+		return strconv.Itoa(int(d.Month())), true
+	case strings.Contains(clean, "yyyy") && !strings.ContainsAny(clean, "dm"):
+		return d.Format("2006"), true
+	case strings.Contains(clean, "yy") && !strings.ContainsAny(clean, "dm"):
+		return d.Format("06"), true
+	case strings.Contains(clean, "mmmm"):
+		if strings.Contains(clean, "yyyy") {
+			return d.Format("2-January-2006"), true
+		}
+		return d.Format("2-January-06"), true
+	case strings.Contains(clean, "mmm"):
+		if strings.Contains(clean, "yyyy") {
+			return d.Format("2-Jan-2006"), true
+		}
+		return d.Format("2-Jan-06"), true
+	case strings.Contains(clean, "yyyy"):
+		return d.Format("02/01/2006"), true
+	default:
+		return d.Format("02/01/06"), true
+	}
 }
 
 // xlsxDisplayBuiltInNumber handles the small set of built-in formats that
@@ -9219,14 +10369,145 @@ func xlsxDisplayBuiltInNumber(n float64, style string) (string, bool) {
 		text := strconv.FormatFloat(xlsxRoundDisplayNumber(n, 2), 'f', 2, 64)
 		whole, frac, _ := strings.Cut(text, ".")
 		return insertThousandsSeparators(whole) + "." + frac, true
+	case "37", "38": // #,##0 ; (#,##0) / [Red](#,##0)
+		return xlsxDisplayBuiltInGroupedNumber(n, 0, true), true
+	case "39", "40": // #,##0.00 ; (#,##0.00) / [Red](#,##0.00)
+		return xlsxDisplayBuiltInGroupedNumber(n, 2, true), true
 	case "9": // 0%
 		return strconv.FormatFloat(xlsxRoundDisplayNumber(n*100, 0), 'f', 0, 64) + "%", true
 	case "10": // 0.00%
 		return strconv.FormatFloat(xlsxRoundDisplayNumber(n*100, 2), 'f', 2, 64) + "%", true
 	case "11": // 0.00E+00
 		return strings.ReplaceAll(strconv.FormatFloat(n, 'E', 2, 64), "E+0", "E+"), true
+	case "14": // localized short date; COM inherits the workbook/Office locale
+		return xlsxDisplayBuiltInDate(n, "1/2/06"), true
+	case "15": // d-mmm-yy
+		return xlsxDisplayBuiltInDate(n, "2-Jan-06"), true
+	case "16": // d-mmm
+		return xlsxDisplayBuiltInDate(n, "2-Jan"), true
+	case "17": // mmm-yy
+		return xlsxDisplayBuiltInDate(n, "Jan-06"), true
+	case "18": // h:mm AM/PM
+		return xlsxDisplayClockTime(n, false), true
+	case "19": // h:mm:ss AM/PM
+		return xlsxDisplayClockTime(n, true), true
+	case "20": // h:mm
+		return xlsxDisplayElapsedTime(n, false, false), true
+	case "45": // mm:ss
+		return xlsxDisplayElapsedTime(n, true, false), true
+	case "46": // [h]:mm:ss
+		return xlsxDisplayElapsedTime(n, false, true), true
+	case "47": // mmss.0
+		return xlsxDisplayMinuteSecondTenths(n), true
 	}
 	return "", false
+}
+
+// xlsxDisplayBuiltInGroupedNumber covers Excel's built-in comma formats.
+// They are not present in styles.xml's numFmt table, so treating only custom
+// format codes leaks the raw stored value for styles 37--40.
+func xlsxDisplayBuiltInGroupedNumber(n float64, decimals int, parentheses bool) string {
+	negative := n < 0
+	if negative {
+		n = -n
+	}
+	text := strconv.FormatFloat(xlsxRoundDisplayNumber(n, decimals), 'f', decimals, 64)
+	whole, frac, hasFraction := strings.Cut(text, ".")
+	text = insertThousandsSeparators(whole)
+	if hasFraction {
+		text += "." + frac
+	}
+	if negative && parentheses {
+		return "(" + text + ")"
+	}
+	return text
+}
+
+func xlsxDisplayClockTime(n float64, seconds bool) string {
+	negative := n < 0
+	if negative {
+		n = -n
+	}
+	// Excel's clock formats wrap by day, unlike elapsed-time format 46.
+	total := int(math.Floor(n*86400+0.5)) % 86400
+	hour := total / 3600
+	minute := (total / 60) % 60
+	second := total % 60
+	ampm := "AM"
+	if hour >= 12 {
+		ampm = "PM"
+	}
+	displayHour := hour % 12
+	if displayHour == 0 {
+		displayHour = 12
+	}
+	out := fmt.Sprintf("%d:%02d", displayHour, minute)
+	if seconds {
+		out += fmt.Sprintf(":%02d", second)
+	}
+	out += " " + ampm
+	if negative {
+		return "-" + out
+	}
+	return out
+}
+
+func xlsxDisplayBuiltInDate(n float64, layout string) string {
+	days := int(math.Floor(n))
+	base := time.Date(1899, time.December, 31, 0, 0, 0, 0, time.UTC)
+	if days >= 60 {
+		days--
+	}
+	return base.AddDate(0, 0, days).Format(layout)
+}
+
+// xlsxDisplayElapsedTime mirrors Excel's built-in time formats.  Time values
+// are stored as a fraction of a day, so emitting the raw numeric value loses
+// the visible content (for example .5 must be "12:00").  Format 46 is an
+// elapsed-time format and deliberately does not wrap after 24 hours.
+func xlsxDisplayElapsedTime(n float64, minuteSecond, elapsed bool) string {
+	negative := n < 0
+	if negative {
+		n = -n
+	}
+	seconds := int(math.Floor(n*86400 + 0.5))
+	if minuteSecond {
+		minutes := seconds / 60
+		out := fmt.Sprintf("%02d:%02d", minutes%60, seconds%60)
+		if negative {
+			return "-" + out
+		}
+		return out
+	}
+	hours := seconds / 3600
+	if !elapsed {
+		hours %= 24
+	}
+	out := fmt.Sprintf("%d:%02d", hours, (seconds/60)%60)
+	if elapsed {
+		out += fmt.Sprintf(":%02d", seconds%60)
+	}
+	if negative {
+		return "-" + out
+	}
+	return out
+}
+
+func xlsxDisplayMinuteSecondTenths(n float64) string {
+	negative := n < 0
+	if negative {
+		n = -n
+	}
+	tenths := int(math.Floor(n*864000 + 0.5))
+	seconds := tenths / 10
+	// Built-in format 47 is mm:ss.0. The colon is a visible glyph; omitting it
+	// turns an Excel time such as 25:19.0 into the unrelated numeric token
+	// 2519.0 in strict UsedRange.Text output.
+	out := fmt.Sprintf("%02d:%02d.%d", (seconds/60)%60, seconds%60, tenths%10)
+	if negative {
+		return "-" + out
+	}
+	return out
 }
 
 // xlsxGeneralDisplayNumberForWidth approximates Excel's General rendering in
@@ -9241,14 +10522,31 @@ func xlsxGeneralDisplayNumberForWidth(n float64, width int) string {
 	if width < 3 {
 		width = 3
 	}
-	if abs >= math.Pow10(width-1) || abs < 1e-4 {
+	if abs >= math.Pow10(width) || abs < 1e-4 {
 		return strings.ReplaceAll(strconv.FormatFloat(n, 'e', 2, 64), "e", "E")
 	}
 	digitsBefore := 1
 	if abs >= 1 {
 		digitsBefore = int(math.Floor(math.Log10(abs))) + 1
+	} else {
+		// Leading fractional zeroes are not significant, but they do consume
+		// rendered column width. Account for them before choosing decimal
+		// places: 0.040140383 in an 11-character General column has one zero
+		// between the decimal point and its first significant digit.
+		leadingFractionalZeros := int(math.Floor(-math.Log10(abs)))
+		if leadingFractionalZeros > 0 {
+			digitsBefore += leadingFractionalZeros
+		}
 	}
+	// Excel's General display also applies its eleven-significant-digit cap in
+	// narrow cells. Previously a width-11 column could emit ten fractional
+	// digits after a single leading zero (0.0401403834), while Range.Text
+	// correctly limits the same value to 0.04014038.
 	decimals := width - digitsBefore - 1 // decimal point consumes one column.
+	maxDecimals := 10 - digitsBefore
+	if decimals > maxDecimals {
+		decimals = maxDecimals
+	}
 	if decimals < 0 {
 		decimals = 0
 	}
@@ -9260,12 +10558,32 @@ func xlsxGeneralDisplayNumberForWidth(n float64, width int) string {
 }
 
 func xlsxDisplayCustomNumber(n float64, format string) (string, bool) {
-	// Minimal custom-format support for the commonly used currency/decimal
-	// forms. It intentionally refuses complex conditional and date formats.
-	if strings.ContainsAny(format, "[];@") || strings.ContainsAny(format, "dDyYmMhHsS") {
+	// Custom formats commonly found in real workbooks include accounting
+	// padding, colour directives and separate positive/negative/zero sections.
+	// Those directives affect layout rather than the cell's visible tokens, so
+	// reduce them to the selected numeric section before formatting.  This is
+	// deliberately not a full Excel format interpreter, but covers the Office
+	// generated Comma/Currency forms (43, 44 and their custom variants) without
+	// leaking their stored floating-point values into strict COM comparisons.
+	if xlsxFormatHasDateOrTimePlaceholders(format) {
 		return "", false
 	}
-	quoted := ""
+	section, ok := xlsxNumberFormatSection(n, format)
+	if !ok {
+		return "", false
+	}
+	format = section
+	negativeSection := n < 0
+	if n < 0 {
+		n = -n
+	}
+	format = xlsxStripNumberFormatDirectives(format)
+	// Quoted literals belong at their original position in the selected format
+	// section. Preserve their position with non-printing sentinels until the
+	// numeric skeleton and surrounding literals have been resolved.
+	const quotedLiteralPrefix = "\x1e"
+	const quotedLiteralSuffix = "\x1f"
+	var quotedLiterals []string
 	for len(format) > 0 {
 		start := strings.IndexByte(format, '"')
 		if start < 0 {
@@ -9275,22 +10593,37 @@ func xlsxDisplayCustomNumber(n float64, format string) (string, bool) {
 		if end < 0 {
 			break
 		}
-		quoted += format[start+1 : start+1+end]
-		format = format[:start] + format[start+2+end:]
+		quotedLiterals = append(quotedLiterals, format[start+1:start+1+end])
+		marker := quotedLiteralPrefix + string(rune('A'+len(quotedLiterals)-1)) + quotedLiteralSuffix
+		format = format[:start] + marker + format[start+2+end:]
 	}
 	decimal := 0
-	if point := strings.IndexByte(format, '.'); point >= 0 {
+	// Dots inside quoted currency/label literals are not decimal placeholders.
+	// Start from the first actual digit placeholder, then look for the decimal
+	// point in the numeric skeleton that follows it.
+	numberStart := strings.IndexAny(format, "0#?")
+	if numberStart < 0 {
+		return "", false
+	}
+	if point := strings.IndexByte(format[numberStart:], '.'); point >= 0 {
+		point += numberStart
 		for _, r := range format[point+1:] {
 			if r == '0' || r == '#' {
 				decimal++
 			}
 		}
 	}
-	if !strings.ContainsAny(format, "0#") {
-		return "", false
+	// A percent sign in an Excel number format changes the displayed magnitude
+	// (the stored fraction .111... is shown as 11.1%), not just the suffix.
+	// Treat it before rounding so both the digits and the decimal precision
+	// match Range.Text.
+	isPercent := strings.Contains(format, "%")
+	if isPercent {
+		n *= 100
+		format = strings.ReplaceAll(format, "%", "")
 	}
 	text := strconv.FormatFloat(xlsxRoundDisplayNumber(n, decimal), 'f', decimal, 64)
-	if strings.Contains(format, ",") {
+	if xlsxNumberFormatUsesGrouping(format) {
 		whole, frac, hasFrac := strings.Cut(text, ".")
 		whole = insertThousandsSeparators(whole)
 		text = whole
@@ -9298,7 +10631,191 @@ func xlsxDisplayCustomNumber(n float64, format string) (string, bool) {
 			text += "." + frac
 		}
 	}
-	return quoted + text, true
+	if isPercent {
+		text += "%"
+	}
+	prefix, suffix := xlsxNumberFormatLiterals(format)
+	if negativeSection && strings.Contains(format, "\\(") && strings.Contains(format, "$") {
+		if i := strings.Index(prefix, "("); i >= 0 {
+			prefix = "(" + strings.Replace(prefix[:i]+prefix[i+1:], "(", "", 1)
+		}
+	}
+	return xlsxRestoreQuotedNumberFormatLiterals(prefix+text+suffix, quotedLiterals, quotedLiteralPrefix, quotedLiteralSuffix), true
+}
+
+func xlsxRestoreQuotedNumberFormatLiterals(value string, literals []string, prefix, suffix string) string {
+	for index, literal := range literals {
+		value = strings.ReplaceAll(value, prefix+string(rune('A'+index))+suffix, literal)
+	}
+	return value
+}
+
+func xlsxFormatHasDateOrTimePlaceholders(format string) bool {
+	inQuote := false
+	escaped := false
+	inBracket := false
+	for _, r := range format {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if r == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if !inQuote && r == '[' {
+			inBracket = true
+			continue
+		}
+		if !inQuote && r == ']' {
+			inBracket = false
+			continue
+		}
+		if !inQuote && !inBracket && strings.ContainsRune("dDyYmMhHsS", r) {
+			return true
+		}
+	}
+	return false
+}
+
+// xlsxNumberFormatSection chooses the Excel format section applicable to n.
+// It keeps quoted semicolons intact, which is important for custom currency
+// labels, while accepting the normal positive;negative;zero;text layout.
+func xlsxNumberFormatSection(n float64, format string) (string, bool) {
+	var sections []string
+	var current strings.Builder
+	inQuote := false
+	escaped := false
+	for _, r := range format {
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			current.WriteRune(r)
+			escaped = true
+			continue
+		}
+		if r == '"' {
+			inQuote = !inQuote
+			current.WriteRune(r)
+			continue
+		}
+		if r == ';' && !inQuote {
+			sections = append(sections, current.String())
+			current.Reset()
+			continue
+		}
+		current.WriteRune(r)
+	}
+	sections = append(sections, current.String())
+	if len(sections) == 0 || sections[0] == "" {
+		return "", false
+	}
+	index := 0
+	if n < 0 && len(sections) >= 2 {
+		index = 1
+	} else if n == 0 && len(sections) >= 3 {
+		index = 2
+	}
+	section := sections[index]
+	// A text-only fourth section is not applicable to a numeric cached value.
+	if !strings.ContainsAny(section, "0#?") {
+		return "", false
+	}
+	return section, true
+}
+
+func xlsxStripNumberFormatDirectives(format string) string {
+	var out strings.Builder
+	for i := 0; i < len(format); i++ {
+		switch format[i] {
+		case '[':
+			if end := strings.IndexByte(format[i+1:], ']'); end >= 0 {
+				i += end + 1
+				continue
+			}
+		case '_', '*':
+			// Underscore reserves the following glyph's width and asterisk fills
+			// spare column width.  Neither is part of Range.Text.
+			if i+1 < len(format) {
+				i++
+			}
+			continue
+		}
+		out.WriteByte(format[i])
+	}
+	return out.String()
+}
+
+func xlsxNumberFormatUsesGrouping(format string) bool {
+	point := strings.IndexByte(format, '.')
+	whole := format
+	if point >= 0 {
+		whole = format[:point]
+	}
+	return strings.Contains(whole, ",")
+}
+
+func xlsxNumberFormatLiterals(format string) (string, string) {
+	first, last := -1, -1
+	for i := 0; i < len(format); i++ {
+		if format[i] == '0' || format[i] == '#' || format[i] == '?' {
+			if first < 0 {
+				first = i
+			}
+			last = i
+		}
+	}
+	if first < 0 {
+		return "", ""
+	}
+	clean := func(value string) string {
+		var out strings.Builder
+		inQuote := false
+		escaped := false
+		for i := 0; i < len(value); i++ {
+			c := value[i]
+			if escaped {
+				out.WriteByte(c)
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inQuote = !inQuote
+				continue
+			}
+			if inQuote || c == 0x1e || c == 0x1f || (c >= 'A' && c <= 'Z') || strings.ContainsRune("$€£¥()%-+ /", rune(c)) {
+				out.WriteByte(c)
+			}
+		}
+		return out.String()
+	}
+	prefix := clean(format[:first])
+	suffix := clean(format[last+1:])
+	// Accounting negative sections frequently encode the opening parenthesis
+	// before the currency marker (for example _($* \(#,##0.00\)).  Excel
+	// renders the currency inside those parentheses, whereas a literal-prefix
+	// pass would produce "$(72.19)". Move that parenthesis in front of the
+	// currency token to retain Excel's visible order.
+	if i := strings.Index(prefix, "("); i >= 0 && i < len(prefix)-1 {
+		if j := strings.IndexAny(prefix[i+1:], "$€£¥"); j >= 0 {
+			j += i + 1
+			prefix = prefix[:i] + "(" + prefix[j:j+1] + prefix[i+1:j] + prefix[j+1:]
+		}
+	}
+	// Percent is appended by the numeric renderer, not retained as a suffix.
+	suffix = strings.ReplaceAll(suffix, "%", "")
+	return prefix, suffix
 }
 
 // Excel rounds formatted decimal values half away from zero, whereas Go's
@@ -9341,6 +10858,13 @@ func xlsxDisplayNumberForCellWidth(value string, styleIndex int, styles xlsxCell
 	if err != nil {
 		return value
 	}
+	// A General column width constrains Range.Text only while it is narrow
+	// enough to require a shortened rendering. Wider columns use Excel's
+	// eleven-significant-digit General representation rather than the raw
+	// stored double.
+	if width >= 9 && math.Abs(n) >= 1 {
+		return xlsxGeneralDisplayNumber(n)
+	}
 	return xlsxGeneralDisplayNumberForWidth(n, width)
 }
 
@@ -9375,8 +10899,11 @@ func xlsxColumnDisplayWidth(widths map[int]int, column int) int {
 	if width, ok := widths[column]; ok {
 		return width
 	}
-	// Excel's default Calibri 11 column width is 8.43 characters.
-	return 8
+	// Excel's default Calibri 11 column width is 8.43 characters. Rounded
+	// upward here so a normally sized General cell follows Excel's regular
+	// eleven-significant-digit display; explicitly narrow columns remain below
+	// the width-sensitive branch above.
+	return 9
 }
 
 func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles xlsxCellStyles, md *xlsxWorksheetMarkdownData, strictOfficeContent bool) error {
@@ -9420,6 +10947,11 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 	var phoneticDepth int
 	var cellDepth int
 	var systemCellTextDepth int
+	// Conditional-formatting follows sheetData in OOXML, so pre-scan it before
+	// reading cells. Data bars and icon sets with showValue=0 render only their
+	// visual indicator; the stored cell value remains in XML but Range.Text is
+	// blank (unless a prior stopIfTrue rule takes precedence).
+	hiddenByDataBar := xlsxHiddenConditionalFormatValueCells(b)
 	for {
 		tok, err := dec.RawToken()
 		if errors.Is(err, io.EOF) {
@@ -9485,7 +11017,7 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 				// cells in hidden rows and columns; only hidden worksheets are
 				// excluded by the workbook-level sheet selection. Compatibility
 				// extraction keeps the historical visible-cell behavior.
-				skipCell = !strictOfficeContent && (rowHidden || hiddenColumnCell(cellRef, hiddenCols) || columnHidden(cellCol, hiddenCols))
+				skipCell = (!strictOfficeContent && (rowHidden || hiddenColumnCell(cellRef, hiddenCols) || columnHidden(cellCol, hiddenCols))) || (strictOfficeContent && hiddenByDataBar[cellRef])
 				collectMarkdownCell = !skipCell && collectMarkdownRow && markdownRowValues != nil && cellCol <= maxMarkdownTableCols
 				if collectMarkdownCell {
 					markdownCellText.Reset()
@@ -9501,7 +11033,11 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 				systemCellTextDepth = 1
 				continue
 			}
-			if !skipCell && worksheetElementMayHaveVisibleTextAttributes(t.Name.Local) && !worksheetElementHiddenByRef(t, hiddenCols, hiddenRows) {
+			// Data-validation prompts, hyperlinks and similar XML attributes are
+			// document annotations, not cell glyphs returned by Excel's
+			// UsedRange.Text. Preserve them for the richer compatibility mode, but
+			// exclude them from the strict Office-visible baseline.
+			if !strictOfficeContent && !skipCell && worksheetElementMayHaveVisibleTextAttributes(t.Name.Local) && !worksheetElementHiddenByRef(t, hiddenCols, hiddenRows) {
 				for _, value := range worksheetAttributeText(t) {
 					if seenAttrs[value] {
 						continue
@@ -9586,8 +11122,11 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 						if strictOfficeContent {
 							// UsedRange.Text returns every visible cell occurrence. Do
 							// not let generic binary-text cleanup collapse legitimate
-							// worksheet literals such as "wml.xsd or dml__ROOT".
-							appendTrimmedTextBlock(out, strings.TrimSpace(value))
+							// worksheet literals such as "wml.xsd or dml__ROOT". Still
+							// process SpreadsheetML _xNNNN_ escapes: Excel renders a
+							// control escape such as _x001A_ as no visible glyph, while
+							// emitting its literal source leaks false text tokens.
+							appendTrimmedTextBlock(out, xlsxStrictOfficeCellText(value))
 						} else if t.Name.Local == "v" && (cellType == "" || cellType == "n") && plainExcelNumberValue(value) {
 							appendTrimmedTextBlock(out, value)
 						} else {
@@ -9639,6 +11178,21 @@ func appendWorksheetText(out *strings.Builder, b []byte, shared []string, styles
 		}
 	}
 	return nil
+}
+
+func xlsxStrictOfficeCellText(value string) string {
+	// Worksheet values are already structurally bounded XML cell content.  Do
+	// not send them through the general cleanText pipeline: its Word-field
+	// heuristics can reinterpret a perfectly ordinary cell which starts with
+	// "#" as a field instruction and erase it.  Excel Range.Text retains that
+	// glyph (for example a literal # in a summary template), so only perform
+	// the SpreadsheetML escape/control cleanup needed for rendered cells.
+	value = strings.ToValidUTF8(value, "")
+	value = decodeOOXMLTextEscapes(value)
+	value = strings.Map(cleanTextRune, value)
+	value = strings.ReplaceAll(value, "\uE000", "'s")
+	value = spaceRE.ReplaceAllString(value, " ")
+	return strings.TrimSpace(value)
 }
 
 func plainExcelNumberValue(value string) bool {
@@ -10797,6 +12351,238 @@ func cellRangeHidden(ref string, hiddenCols, hiddenRows []intRange) (bool, bool)
 	return rangeCoveredByRanges(startCol, endCol, hiddenCols) || rangeCoveredByRanges(startRow, endRow, hiddenRows), true
 }
 
+// xlsxCellRefsInRange expands the modest sqref ranges used by conditional
+// formatting. A hard ceiling keeps adversarial whole-column references from
+// allocating unbounded memory; in that case callers retain the raw cell text.
+func xlsxCellRefsInRange(ref string) []string {
+	parts := strings.Split(strings.TrimSpace(ref), ":")
+	if len(parts) == 0 || len(parts) > 2 {
+		return nil
+	}
+	startCol, startRow, ok := cellRefIndexes(parts[0])
+	if !ok {
+		return nil
+	}
+	endCol, endRow := startCol, startRow
+	if len(parts) == 2 {
+		endCol, endRow, ok = cellRefIndexes(parts[1])
+		if !ok {
+			return nil
+		}
+	}
+	if endCol < startCol {
+		startCol, endCol = endCol, startCol
+	}
+	if endRow < startRow {
+		startRow, endRow = endRow, startRow
+	}
+	if (endCol-startCol+1)*(endRow-startRow+1) > 100000 {
+		return nil
+	}
+	out := make([]string, 0, (endCol-startCol+1)*(endRow-startRow+1))
+	for row := startRow; row <= endRow; row++ {
+		for col := startCol; col <= endCol; col++ {
+			out = append(out, xlsxCellRefName(col, row))
+		}
+	}
+	return out
+}
+
+func xlsxHiddenConditionalFormatValueCells(b []byte) map[string]bool {
+	type stopIfTrueRule struct {
+		refs     string
+		operator string
+		formulas []string
+	}
+	hidden := map[string]bool{}
+	if len(b) == 0 || (!bytes.Contains(b, []byte("dataBar")) && !bytes.Contains(b, []byte("iconSet"))) {
+		return hidden
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	var conditionalRefs string
+	var dataBarDepth int
+	showValue := true
+	var stopIfTrueRules []stopIfTrueRule
+	var hiddenRefs []string
+	var currentStopRule *stopIfTrueRule
+	var currentCellRef, currentCellType string
+	var inCellValue bool
+	var cellValue strings.Builder
+	var inFormula bool
+	var formula strings.Builder
+	cellValues := map[string]float64{}
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) || err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "c":
+				currentCellRef, currentCellType = "", ""
+				for _, a := range t.Attr {
+					switch a.Name.Local {
+					case "r":
+						currentCellRef = a.Value
+					case "t":
+						currentCellType = a.Value
+					}
+				}
+			case "v":
+				if currentCellRef != "" {
+					inCellValue = true
+					cellValue.Reset()
+				}
+			case "conditionalFormatting":
+				conditionalRefs = ""
+				for _, a := range t.Attr {
+					if a.Name.Local == "sqref" {
+						conditionalRefs = a.Value
+						break
+					}
+				}
+			case "cfRule":
+				currentStopRule = nil
+				var stop bool
+				var ruleType, operator string
+				for _, a := range t.Attr {
+					switch a.Name.Local {
+					case "stopIfTrue":
+						stop = boolAttrValue(a.Value)
+					case "type":
+						ruleType = a.Value
+					case "operator":
+						operator = a.Value
+					}
+				}
+				if stop && ruleType == "cellIs" && conditionalRefs != "" {
+					currentStopRule = &stopIfTrueRule{refs: conditionalRefs, operator: operator}
+				}
+			case "formula":
+				if currentStopRule != nil {
+					inFormula = true
+					formula.Reset()
+				}
+			case "dataBar", "iconSet":
+				dataBarDepth++
+				showValue = true
+				for _, a := range t.Attr {
+					if a.Name.Local == "showValue" && !boolAttrValue(a.Value) {
+						showValue = false
+						break
+					}
+				}
+			}
+		case xml.EndElement:
+			if t.Name.Local == "v" && inCellValue {
+				inCellValue = false
+				if currentCellType == "" || currentCellType == "n" {
+					if value, err := strconv.ParseFloat(strings.TrimSpace(cellValue.String()), 64); err == nil {
+						cellValues[currentCellRef] = value
+					}
+				}
+			}
+			if t.Name.Local == "formula" && inFormula {
+				inFormula = false
+				if currentStopRule != nil {
+					currentStopRule.formulas = append(currentStopRule.formulas, strings.TrimSpace(formula.String()))
+				}
+			}
+			if t.Name.Local == "cfRule" && currentStopRule != nil {
+				stopIfTrueRules = append(stopIfTrueRules, *currentStopRule)
+				currentStopRule = nil
+			}
+			if (t.Name.Local == "dataBar" || t.Name.Local == "iconSet") && dataBarDepth > 0 {
+				dataBarDepth--
+				if dataBarDepth == 0 && !showValue {
+					hiddenRefs = append(hiddenRefs, conditionalRefs)
+				}
+			}
+		case xml.CharData:
+			if inCellValue {
+				cellValue.Write([]byte(t))
+			}
+			if inFormula {
+				formula.Write([]byte(t))
+			}
+		}
+	}
+	for _, refs := range hiddenRefs {
+		for _, ref := range worksheetRefFields(refs) {
+			for _, cell := range xlsxCellRefsInRange(ref) {
+				hidden[cell] = true
+			}
+		}
+	}
+	// A prior cellIs/stopIfTrue rule leaves only the cells matching its numeric
+	// predicate visible.  This covers the ordinary rules emitted by Excel and
+	// ClosedXML without pretending to evaluate arbitrary Excel formulas.
+	for _, rule := range stopIfTrueRules {
+		for _, ref := range worksheetRefFields(rule.refs) {
+			for _, cell := range xlsxCellRefsInRange(ref) {
+				if xlsxCellIsStopIfTrueMatch(cellValues[cell], rule.operator, rule.formulas) {
+					delete(hidden, cell)
+				}
+			}
+		}
+	}
+	return hidden
+}
+
+func xlsxCellIsStopIfTrueMatch(value float64, operator string, formulas []string) bool {
+	if len(formulas) == 0 {
+		return false
+	}
+	bound, err := strconv.ParseFloat(strings.TrimPrefix(strings.TrimSpace(formulas[0]), "="), 64)
+	if err != nil {
+		return false
+	}
+	switch operator {
+	case "equal":
+		return value == bound
+	case "notEqual":
+		return value != bound
+	case "greaterThan":
+		return value > bound
+	case "greaterThanOrEqual":
+		return value >= bound
+	case "lessThan":
+		return value < bound
+	case "lessThanOrEqual":
+		return value <= bound
+	case "between":
+		if len(formulas) < 2 {
+			return false
+		}
+		upper, err := strconv.ParseFloat(strings.TrimPrefix(strings.TrimSpace(formulas[1]), "="), 64)
+		return err == nil && value >= bound && value <= upper
+	case "notBetween":
+		if len(formulas) < 2 {
+			return false
+		}
+		upper, err := strconv.ParseFloat(strings.TrimPrefix(strings.TrimSpace(formulas[1]), "="), 64)
+		return err == nil && (value < bound || value > upper)
+	default:
+		return false
+	}
+}
+
+func xlsxCellRefName(col, row int) string {
+	if col < 1 || row < 1 {
+		return ""
+	}
+	var letters [8]byte
+	i := len(letters)
+	for col > 0 {
+		col--
+		i--
+		letters[i] = byte('A' + col%26)
+		col /= 26
+	}
+	return string(letters[i:]) + strconv.Itoa(row)
+}
+
 func rangeCoveredByRanges(min, max int, ranges []intRange) bool {
 	if min <= 0 || max < min {
 		return false
@@ -11164,13 +12950,18 @@ func extractOOXMLImages(files map[string]*zip.File, kind string, includeMetadata
 		prefix = "/media/"
 	}
 	var names []string
+	strict := len(strictOfficeImages) > 0 && strictOfficeImages[0]
 	for name := range files {
-		if isOOXMLMediaPart(name, prefix, kind) || (includeMetadata && isOOXMLThumbnail(name)) {
+		// Although Word normally stores images under word/media, OPC permits a
+		// document relationship to target a package-root media part.  Include
+		// those only for strict Word comparison; the relationship filter below
+		// still decides whether Word exposes the part as a Picture Shape.
+		strictDocxRootMedia := strict && kind == "docx" && strings.HasPrefix(ooxmlPartKey(name), "media/")
+		if isOOXMLMediaPart(name, prefix, kind) || strictDocxRootMedia || (includeMetadata && isOOXMLThumbnail(name)) {
 			names = append(names, name)
 		}
 	}
 	visibleMedia, filterMedia := visibleOOXMLMediaParts(files, kind)
-	strict := len(strictOfficeImages) > 0 && strictOfficeImages[0]
 	if strict && kind == "docx" {
 		visibleMedia, filterMedia = strictDocxVisibleMediaParts(files)
 	}
@@ -11271,17 +13062,30 @@ func docxStrictVisibleImageOccurrences(files map[string]*zip.File, images []Imag
 	}
 	parts := make([]string, 0, len(ids))
 	for _, id := range ids {
-		if part := docxRelationshipMediaPart(files, document, rels[id]); part != "" {
-			parts = append(parts, part)
+		target, known := rels[id]
+		if known {
+			if part := docxRelationshipMediaPart(files, document, target); part != "" {
+				parts = append(parts, part)
+			}
+			continue
+		}
+		if !known && id == "" {
+			continue
 		}
 	}
-	return ooxmlImageOccurrencesForParts(parts, images)
+	return ooxmlImageOccurrencesForPartsWithFiles(parts, images, files)
 }
 
 func xlsxStrictVisibleImageOccurrences(files map[string]*zip.File, images []Image) []Image {
-	media, found := xlsxStrictVisibleMediaOccurrenceNames(files)
-	if !found {
-		return images
+	media, _ := xlsxStrictVisibleMediaOccurrenceNames(files)
+	// Excel's Shapes collection exposes picture shapes from worksheet Drawing
+	// parts.  A VML legacyDrawing can reference an image (commonly a header,
+	// comment, or compatibility artefact), but it is not exposed as an Excel
+	// Picture Shape.  In strict Office mode, lack of a verified Drawing
+	// occurrence must therefore mean no visible picture, rather than falling
+	// back to every package media part.
+	if len(media) == 0 {
+		return nil
 	}
 	byPart := map[string][]Image{}
 	for _, image := range images {
@@ -11311,10 +13115,10 @@ func xlsxStrictVisibleImageOccurrences(files map[string]*zip.File, images []Imag
 }
 
 // pptxStrictVisibleImageOccurrences mirrors PowerPoint's Slide.Shapes
-// collection. A media part can be used by several top-level Picture Shapes;
-// keep every visible shape occurrence instead of returning one image per ZIP
-// part. Group members and OLE previews are deliberately excluded because the
-// COM baseline enumerates only top-level msoPicture/msoLinkedPicture shapes.
+// collection. A media part can be used by several Picture Shapes; keep every
+// visible shape occurrence instead of returning one image per ZIP part. Group
+// members are rendered and exposed by PowerPoint through GroupItems, so they
+// are included; OLE previews remain excluded.
 //
 // Callers must pass the pre-filtered image set: a drawing can legitimately
 // reuse one media part, whereas an orphaned media part must never be revived
@@ -11351,6 +13155,58 @@ func ooxmlImageOccurrencesForParts(parts []string, images []Image) []Image {
 		if len(available) > 0 {
 			out = append(out, available[0])
 		}
+	}
+	return out
+}
+
+// ooxmlImageOccurrencesForPartsWithFiles preserves a strict OOXML occurrence
+// even when its image payload is deliberately not materialized by the normal
+// image pipeline (for example a valid WMF that a caller cannot decode).  Word
+// nevertheless exposes that placement as a Picture Shape, so dropping it
+// would make the strict COM image count wrong. Existing materialized Images
+// still win, retaining their exact decoded data and metadata.
+func ooxmlImageOccurrencesForPartsWithFiles(parts []string, images []Image, files map[string]*zip.File) []Image {
+	byName := map[string][]Image{}
+	for _, image := range images {
+		key := strings.ToLower(image.Name)
+		byName[key] = append(byName[key], image)
+	}
+	used := map[string]bool{}
+	out := make([]Image, 0, len(parts))
+	for _, part := range parts {
+		baseName := ooxmlImageOutputBaseName(part)
+		name := imageNameWithExt(baseName, strings.ToLower(path.Ext(part)))
+		key := strings.ToLower(name)
+		available := byName[key]
+		if len(available) == 0 {
+			base := strings.ToLower(strings.TrimSuffix(baseName, path.Ext(baseName)))
+			for candidate, values := range byName {
+				if len(values) > 0 && strings.EqualFold(strings.TrimSuffix(candidate, path.Ext(candidate)), base) {
+					available = values
+					break
+				}
+			}
+		}
+		if len(available) > 0 {
+			image := available[0]
+			image.Name = uniqueImageFilename(sanitizeFilename(image.Name), used)
+			out = append(out, image)
+			continue
+		}
+		f := ooxmlFile(files, part)
+		if f == nil {
+			continue
+		}
+		data, err := readZipFile(f)
+		if err != nil {
+			continue
+		}
+		ext := strings.ToLower(path.Ext(part))
+		if ext == "" || !isSupportedImageExt(ext) {
+			continue
+		}
+		name = uniqueImageFilename(sanitizeFilename(imageNameWithExt(baseName, ext)), used)
+		out = append(out, Image{Name: name, Ext: ext, Data: data})
 	}
 	return out
 }
@@ -11400,8 +13256,97 @@ func xlsxStrictVisibleMediaOccurrenceNames(files map[string]*zip.File) ([]string
 				}
 			}
 		}
+		// An Excel legacyDrawing normally holds comments or form controls, neither
+		// of which is a Picture Shape.  Its VML PictureFrame form (ClientData
+		// ObjectType="Pict"), however, is exposed by Worksheet.Shapes as an
+		// msoPicture.  Keep precisely those occurrences: treating every VML image
+		// as a picture would revive comment artwork and compatibility caches.
+		for _, drawing := range relationshipTargetsWithPrefix(files, sheet.Path, "xl/drawings/") {
+			if !strings.HasSuffix(ooxmlPartKey(drawing), ".vml") {
+				continue
+			}
+			refs, err := xlsxVMLPictureRelationshipIDOccurrences(files, drawing, xlsxOLEObjectShapeIDs(files, sheet.Path))
+			if err != nil || len(refs) == 0 {
+				continue
+			}
+			foundDrawing = true
+			rels, err := relationshipTargetMapForPart(files, drawing)
+			if err != nil {
+				continue
+			}
+			for _, id := range refs {
+				if media := relationshipMediaPart(files, drawing, rels[id], "xl/media/"); media != "" {
+					out = append(out, media)
+				}
+			}
+		}
 	}
 	return out, foundDrawing
+}
+
+// xlsxVMLPictureRelationshipIDOccurrences returns the image relationships of
+// VML PictureFrame controls. Excel persists comments, buttons, dropdowns and
+// miscellaneous compatibility objects in the same legacyDrawing part; only
+// ObjectType="Pict" participates in Worksheet.Shapes as a picture. An
+// oleObject can reuse that form for its preview artwork: COM exposes it as an
+// embedded object rather than msoPicture, so its VML shape IDs are excluded.
+func xlsxVMLPictureRelationshipIDOccurrences(files map[string]*zip.File, drawing string, oleShapeIDs map[string]bool) ([]string, error) {
+	b, err := readZipFile(ooxmlFile(files, drawing))
+	if err != nil {
+		return nil, err
+	}
+	if hasDOCTYPE(b) {
+		return nil, errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	shapeDepth := 0
+	pictureShape := false
+	shapeID := ""
+	var shapeIDs []string
+	var ids []string
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return ids, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch value := tok.(type) {
+		case xml.StartElement:
+			if value.Name.Local == "shape" && (strings.Contains(strings.ToLower(value.Name.Space), "vml") || strings.HasPrefix(strings.ToLower(xmlAttrValue(value, "id")), "_x0000_") || xmlAttrValue(value, "id") != "") {
+				if shapeDepth == 0 {
+					pictureShape = false
+					shapeID = normalizeVMLShapeID(xmlAttrValue(value, "id"))
+					shapeIDs = shapeIDs[:0]
+				}
+				shapeDepth++
+				continue
+			}
+			if shapeDepth == 0 {
+				continue
+			}
+			if value.Name.Local == "ClientData" && strings.EqualFold(xmlAttrValue(value, "ObjectType"), "Pict") {
+				pictureShape = !oleShapeIDs[shapeID]
+				continue
+			}
+			if value.Name.Local == "imagedata" {
+				shapeIDs = append(shapeIDs, imageRelationshipIDs(value)...)
+			}
+		case xml.EndElement:
+			if value.Name.Local == "shape" && shapeDepth > 0 {
+				shapeDepth--
+				if shapeDepth == 0 {
+					if pictureShape {
+						ids = append(ids, shapeIDs...)
+					}
+					pictureShape = false
+					shapeID = ""
+					shapeIDs = shapeIDs[:0]
+				}
+			}
+		}
+	}
 }
 
 func xlsxDrawingImageRefsInOrder(files map[string]*zip.File, drawing string) ([]string, error) {
@@ -11581,10 +13526,29 @@ func docxVisibleHTMLPartNamesNoError(files map[string]*zip.File) []string {
 
 func docxRelationshipMediaPart(files map[string]*zip.File, source, target string) string {
 	part := resolveOOXMLRelationshipTarget(source, target)
+	if part == "" {
+		// Word accepts package-root image targets (Target="/media/...") even
+		// though the generic cross-root resolver correctly rejects arbitrary
+		// Word-to-package-root relationships.  Admit only that narrow, normalized
+		// media location here; every other cross-root target stays rejected.
+		clean := cleanOOXMLRelationshipTarget(target)
+		if strings.HasPrefix(clean, "/") {
+			candidate := strings.TrimPrefix(path.Clean(clean), "/")
+			if strings.HasPrefix(strings.ToLower(candidate), "media/") {
+				part = candidate
+			}
+		}
+	}
 	if actual := ooxmlPartName(files, part); actual != "" {
 		part = actual
 	}
-	if strings.HasPrefix(ooxmlPartKey(part), "word/media/") {
+	// Most Word image relationships target word/media.  A valid OPC package can
+	// also place a document-owned image at package root (for example
+	// Target="/media/image.png"); Word still exposes it as an InlinePicture.
+	// Accept a resolved package-root media part while retaining the explicit
+	// source-root validation in resolveOOXMLRelationshipTarget.
+	key := ooxmlPartKey(part)
+	if strings.HasPrefix(key, "word/media/") || strings.HasPrefix(key, "media/") {
 		return part
 	}
 	return ""
@@ -12100,7 +14064,7 @@ func pptxVisibleMediaParts(files map[string]*zip.File) (map[string]bool, bool) {
 }
 
 // strictPptxVisibleMediaParts follows PowerPoint's Picture Shape model. It
-// accepts direct p:pic references on visible slides and chart-owned artwork,
+// accepts direct p:pic references on visible slides, including group members,
 // while deliberately excluding master/layout resources and OLE previews.
 func strictPptxVisibleMediaParts(files map[string]*zip.File) (map[string]bool, bool) {
 	visible := map[string]bool{}
@@ -12186,7 +14150,34 @@ func pptxStrictSlidePictureMediaOccurrences(files map[string]*zip.File, slide st
 		}
 	}
 	appendMedia(slide, ids, rels)
-	for _, target := range rels {
+	// PowerPoint repairs a small class of producer defects where a p:pic blip
+	// still names rIdN but that one entry is absent from slideN.xml.rels.  Do
+	// not fall back to arbitrary package media: infer a missing target only if
+	// two or more ordinary image relationships on this same slide establish the
+	// same rId-to-image-number offset (for example rId2 -> image102 and rId12
+	// -> image112).  This mirrors Office's recovered Picture Shape while
+	// keeping orphaned media out of the strict result.
+	for _, id := range ids {
+		if _, found := rels[id]; found {
+			continue
+		}
+		if part := pptxRecoveredMissingImageRelationshipPart(files, id, rels); part != "" {
+			out = append(out, part)
+		}
+	}
+	// A relationship entry alone does not make VML slide artwork visible.
+	// PowerPoint packages can retain unreferenced VML chart/PictureFrame caches
+	// after conversion; unlike a p:pic, those are not materialized as Shapes.
+	// Follow only a legacyDrawing relationship actually named by the slide XML.
+	vmlDrawingIDs, err := pptxVMLDrawingRelationshipIDs(b)
+	if err != nil {
+		return nil, false
+	}
+	for _, id := range vmlDrawingIDs {
+		target := rels[id]
+		if target == "" {
+			continue
+		}
 		part := resolveOOXMLRelationshipTarget(slide, target)
 		if !strings.HasSuffix(ooxmlPartKey(part), ".vml") {
 			continue
@@ -12218,6 +14209,83 @@ func pptxStrictSlidePictureMediaOccurrences(files map[string]*zip.File, slide st
 	return out, true
 }
 
+func pptxVMLDrawingRelationshipIDs(b []byte) ([]string, error) {
+	if hasDOCTYPE(b) {
+		return nil, errors.New("xml doctype is not supported")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	var ids []string
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return ids, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		switch start.Name.Local {
+		case "legacyDrawing", "legacyDrawingHF", "vmlDrawing":
+			if id := strings.TrimSpace(xmlAttrValue(start, "id")); id != "" {
+				ids = append(ids, id)
+			}
+		}
+	}
+}
+
+func pptxRecoveredMissingImageRelationshipPart(files map[string]*zip.File, id string, rels map[string]string) string {
+	missingID, ok := pptxRelationshipNumericID(id)
+	if !ok {
+		return ""
+	}
+	offsetCounts := map[int]int{}
+	for knownID, target := range rels {
+		idNumber, ok := pptxRelationshipNumericID(knownID)
+		if !ok {
+			continue
+		}
+		part := resolveOOXMLRelationshipTarget("ppt/slides/slide.xml", target)
+		base := strings.ToLower(path.Base(part))
+		match := regexp.MustCompile(`^image([0-9]+)\.[a-z0-9]+$`).FindStringSubmatch(base)
+		if len(match) != 2 {
+			continue
+		}
+		imageNumber, err := strconv.Atoi(match[1])
+		if err != nil {
+			continue
+		}
+		offsetCounts[imageNumber-idNumber]++
+	}
+	bestOffset, support := 0, 0
+	for offset, count := range offsetCounts {
+		if count > support {
+			bestOffset, support = offset, count
+		}
+	}
+	if support < 2 {
+		return ""
+	}
+	wanted := missingID + bestOffset
+	for _, ext := range []string{".png", ".jpeg", ".jpg", ".gif", ".bmp", ".emf", ".wmf"} {
+		candidate := fmt.Sprintf("ppt/media/image%d%s", wanted, ext)
+		if actual := ooxmlPartName(files, candidate); actual != "" {
+			return actual
+		}
+	}
+	return ""
+}
+
+func pptxRelationshipNumericID(id string) (int, bool) {
+	if !strings.HasPrefix(id, "rId") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(id, "rId"))
+	return n, err == nil && n > 0
+}
+
 func pptxVMLPictureRelationshipIDOccurrences(b []byte) ([]string, error) {
 	if hasDOCTYPE(b) {
 		return nil, errors.New("xml doctype is not supported")
@@ -12239,6 +14307,14 @@ func pptxVMLPictureRelationshipIDOccurrences(b []byte) ([]string, error) {
 			if t.Name.Local == "shape" && strings.Contains(strings.ToLower(t.Name.Space), "vml") {
 				if shapeDepth == 0 {
 					hidden = drawingObjectElementHidden(t)
+					// HTML-to-PowerPoint exporters retain VML PictureFrames named
+					// HTMLText*/HTMLHidden*.  These are staging frames rather than
+					// visible Slide.Shapes; their presentation in COM must be
+					// accounted for separately from the package drawing tree.
+					id := strings.ToLower(xmlAttrValue(t, "id"))
+					if strings.HasPrefix(id, "htmltext") || strings.HasPrefix(id, "htmlhidden") {
+						hidden = true
+					}
 					// Legacy Office VML drawing parts use anonymous _x0000_s*
 					// PictureFrame caches. PowerPoint does not materialize these
 					// as Slide.Shapes. HTML-imported VML uses authored IDs (for
@@ -12300,7 +14376,11 @@ func pptxPictureRelationshipIDOccurrences(b []byte) ([]string, error) {
 			if pictureDepth == 0 {
 				continue
 			}
-			if drawingObjectElementHidden(t) {
+			// PowerPoint DrawingML can carry a14:hiddenFill/hiddenLine formatting
+			// extensions. Those are Office UI fallback styles, not a hidden
+			// Slide.Shape; applying the VML/Word z-index heuristic here drops
+			// visible imported pictures.
+			if pptxPictureElementExplicitlyHidden(t) {
 				pictureHidden = true
 			}
 			// A picture placeholder (p:ph) inherits its artwork from the slide
@@ -12319,7 +14399,7 @@ func pptxPictureRelationshipIDOccurrences(b []byte) ([]string, error) {
 			if t.Name.Local == "videoFile" {
 				pictureHidden = true
 			}
-			if !pictureHidden {
+			if !pictureHidden && t.Name.Local == "blip" {
 				pictureRefs = append(pictureRefs, imageRelationshipIDs(t)...)
 			}
 		case xml.EndElement:
@@ -12338,6 +14418,28 @@ func pptxPictureRelationshipIDOccurrences(b []byte) ([]string, error) {
 			}
 		}
 	}
+}
+
+func pptxPictureElementExplicitlyHidden(start xml.StartElement) bool {
+	for _, attr := range start.Attr {
+		if strings.EqualFold(attr.Name.Local, "hidden") && boolAttrValue(attr.Value) {
+			return true
+		}
+		if !strings.EqualFold(attr.Name.Local, "style") {
+			continue
+		}
+		for _, declaration := range strings.Split(strings.ToLower(attr.Value), ";") {
+			key, value, ok := strings.Cut(strings.TrimSpace(declaration), ":")
+			if !ok {
+				continue
+			}
+			key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+			if (key == "display" && value == "none") || (key == "visibility" && (value == "hidden" || value == "collapse")) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func pptxPictureIsMediaPlayerCache(start xml.StartElement) bool {
@@ -12483,6 +14585,13 @@ func xlsxVisibleMediaParts(files map[string]*zip.File) (map[string]bool, bool) {
 	}
 	hidden := xlsxHiddenMediaParts(files)
 	hiddenObjects, visibleObjects := xlsxVisibleSheetObjectMediaParts(files, sheets)
+	// VML legacyDrawing parts may contain an Excel PictureFrame control.  It is
+	// surfaced by Worksheet.Shapes but is not represented by DrawingML blips;
+	// include it in the media admission set before strict occurrence expansion.
+	for name := range xlsxVisibleVMLPictureMediaParts(files, sheets) {
+		visibleObjects[name] = true
+		foundRels = true
+	}
 	if !foundRels {
 		if len(hidden) > 0 || len(hiddenObjects) > 0 {
 			return map[string]bool{}, true
@@ -12559,6 +14668,71 @@ func xlsxVisibleSheetObjectMediaParts(files map[string]*zip.File, sheets []workb
 		}
 	}
 	return hidden, visible
+}
+
+func xlsxVisibleVMLPictureMediaParts(files map[string]*zip.File, sheets []workbookSheet) map[string]bool {
+	visible := map[string]bool{}
+	for _, sheet := range sheets {
+		for _, drawing := range relationshipTargetsWithPrefix(files, sheet.Path, "xl/drawings/") {
+			if !strings.HasSuffix(ooxmlPartKey(drawing), ".vml") {
+				continue
+			}
+			ids, err := xlsxVMLPictureRelationshipIDOccurrences(files, drawing, xlsxOLEObjectShapeIDs(files, sheet.Path))
+			if err != nil || len(ids) == 0 {
+				continue
+			}
+			rels, err := relationshipTargetMapForPart(files, drawing)
+			if err != nil {
+				continue
+			}
+			for _, id := range ids {
+				if part := relationshipMediaPart(files, drawing, rels[id], "xl/media/"); part != "" {
+					visible[part] = true
+				}
+			}
+		}
+	}
+	return visible
+}
+
+// xlsxOLEObjectShapeIDs returns the VML shape IDs that worksheet oleObjects
+// identify as embedded-object previews. They often use a VML Pict ClientData
+// node and an image relationship, but Excel exposes them as msoEmbeddedOLEObject
+// rather than as msoPicture.
+func xlsxOLEObjectShapeIDs(files map[string]*zip.File, sheetPart string) map[string]bool {
+	ids := map[string]bool{}
+	b, err := readZipFile(ooxmlFile(files, sheetPart))
+	if err != nil || hasDOCTYPE(b) {
+		return ids
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return ids
+		}
+		if err != nil {
+			return ids
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok || start.Name.Local != "oleObject" {
+			continue
+		}
+		if id := normalizeVMLShapeID(xmlAttrValue(start, "shapeId")); id != "" {
+			ids[id] = true
+		}
+	}
+}
+
+func normalizeVMLShapeID(id string) string {
+	id = strings.TrimSpace(strings.ToLower(id))
+	if id == "" {
+		return ""
+	}
+	if strings.HasPrefix(id, "_x0000_s") {
+		return strings.TrimPrefix(id, "_x0000_s")
+	}
+	return id
 }
 
 func relationshipTargetsWithPrefix(files map[string]*zip.File, source, prefix string) []string {
@@ -12727,7 +14901,13 @@ func relationshipTargets(b []byte) ([]string, error) {
 		if !ok || start.Name.Local != "Relationship" {
 			continue
 		}
-		target := cleanText(xmlAttrValue(start, "Target"))
+		// Relationship targets are OPC locators, not visible document text.  Do
+		// not pass them through cleanText: its metadata/resource filtering can
+		// legitimately erase a media name such as "image111.jpeg", making a
+		// visible DrawingML picture impossible to resolve back to its package
+		// part.  Target-mode and path validation happen at the relationship
+		// consumer, so retain the exact trimmed locator here.
+		target := strings.TrimSpace(xmlAttrValue(start, "Target"))
 		mode := strings.TrimSpace(xmlAttrValue(start, "TargetMode"))
 		if target != "" && !strings.EqualFold(mode, "External") {
 			out = append(out, target)
@@ -12768,7 +14948,13 @@ func relationshipTargetMap(b []byte) (map[string]string, error) {
 			continue
 		}
 		id := strings.TrimSpace(xmlAttrValue(start, "Id"))
-		target := cleanText(xmlAttrValue(start, "Target"))
+		// Relationship targets are OPC locators, not visible document text.  Do
+		// not pass them through cleanText: its metadata/resource filtering can
+		// legitimately erase a media name such as "image111.jpeg", making a
+		// visible DrawingML picture impossible to resolve back to its package
+		// part.  Target-mode and path validation happen at the relationship
+		// consumer, so retain the exact trimmed locator here.
+		target := strings.TrimSpace(xmlAttrValue(start, "Target"))
 		mode := strings.TrimSpace(xmlAttrValue(start, "TargetMode"))
 		if id != "" && target != "" && !strings.EqualFold(mode, "External") {
 			targets[id] = target

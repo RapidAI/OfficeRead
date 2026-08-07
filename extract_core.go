@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -53,6 +54,11 @@ type Options struct {
 	// StrictOfficeContent limits OOXML text to what Office's primary document
 	// content API exposes, excluding cached drawing/chart data.
 	StrictOfficeContent bool
+	// OfficeFieldTime is an optional reference clock for evaluating Word DATE
+	// fields in strict Office-content mode. COM compatibility tests provide the
+	// moment at which Word produced its Content.Text baseline, so a picture that
+	// includes seconds remains deterministic across the two processes.
+	OfficeFieldTime time.Time
 }
 
 func Extract(filename string, opts Options) (*Result, error) {

@@ -531,6 +531,14 @@ func cleanTextFastPath(s string) (string, bool) {
 	if cleanTextFastPathControlFragment(s) {
 		return "", false
 	}
+	// The byte-only fast path must not bypass the narrowly scoped legacy
+	// contraction repairs below.  These forms are otherwise ordinary ASCII/
+	// UTF-8 prose, so returning early used to leave a smart apostrophe in
+	// "don’t" while the same text took the correct path when any other markup
+	// character was present.
+	if strings.Contains(s, "’") || strings.ContainsRune(s, '뭪') {
+		return "", false
+	}
 	if strings.ContainsAny(s, "/\\%[]()") || containsRIDFold(s) {
 		return "", false
 	}
@@ -888,9 +896,65 @@ func stripWordFieldInstructions(s string) string {
 	if s == "" {
 		return s
 	}
-	if !containsWordFieldInstructionMarker(s) {
+	// Legacy form controls serialize their instruction names into the binary
+	// text stream, while Word.Content.Text exposes only the surrounding visible
+	// labels/result. Unlike DATE/PAGE these names are not ordinary prose in a
+	// Word document, so they can be removed without a neighboring field marker.
+	s = wordFormFieldPlaceholderRE.ReplaceAllString(s, "")
+	// Bare words such as "DATE" in a table heading are visible document
+	// content, not field instructions.  A legacy binary Word story does not
+	// retain the field-control bytes after text normalization, so stripping an
+	// orphan token merely because the line happens to contain DATE/TIME/PAGE
+	// loses legitimate content (for example "FINAL STATUS DATE").  Only apply
+	// the broad orphan-token cleanup when another field construct on the line
+	// proves that this is actually an instruction.
+	hasStructuredInstruction := wordHyperlinkFieldRE.MatchString(s) ||
+		wordStyleRefFieldRE.MatchString(s) ||
+		wordNamedFieldRE.MatchString(s) ||
+		wordLinkFieldRE.MatchString(s) ||
+		wordIncludeTextFieldRE.MatchString(s) ||
+		wordEmbedFieldRE.MatchString(s) ||
+		wordMacroButtonFieldRE.MatchString(s) ||
+		wordTemplateFieldRE.MatchString(s) ||
+		wordTOCFieldRE.MatchString(s) ||
+		wordTOCBookmarkFieldRE.MatchString(s) ||
+		wordInternalBookmarkRE.MatchString(s) ||
+		wordTOCInternalBookmarkRE.MatchString(s) ||
+		wordSeqFieldRE.MatchString(s) ||
+		wordIndexEntryFieldRE.MatchString(s) ||
+		strings.Contains(s, "QUOTE") ||
+		strings.Contains(s, "AUTOTEXT") ||
+		strings.Contains(s, "LISTNUM") ||
+		strings.Contains(s, "AUTONUM") ||
+		wordPromptFieldRE.MatchString(s) ||
+		wordSetFieldRE.MatchString(s) ||
+		wordIfFieldRE.MatchString(s) ||
+		wordBibliographyFieldRE.MatchString(s) ||
+		wordDatabaseFieldRE.MatchString(s) ||
+		wordAdvanceFieldRE.MatchString(s) ||
+		wordPrivateAddinFieldRE.MatchString(s) ||
+		wordPicturePathFieldRE.MatchString(s) ||
+		wordSymbolFieldRE.MatchString(s) ||
+		wordFormattedSimpleFieldRE.MatchString(s) ||
+		wordSimpleFieldRE.MatchString(s) ||
+		wordFormatSwitchRE.MatchString(s) ||
+		wordMergeFormatRE.MatchString(s)
+	// Do not run any instruction regex over a normal visible line. Several
+	// field names (notably DATE) are ordinary document words, and the regexes
+	// intentionally accept a bare field name to clean malformed instructions.
+	// The structured probe above decides whether this line warrants removal.
+	if !hasStructuredInstruction {
 		return s
 	}
+	// Preserve literal DATE headings while still removing a concrete field that
+	// appears elsewhere in the same long legacy paragraph. The heading guard is
+	// only needed for generic/simple field cleanup; a HYPERLINK has an explicit
+	// quoted/URL target and can be removed without ambiguity.
+	keepBareFieldNames := wordVisibleHeadingWithBareFieldName(s)
+	// A few legacy Word fields duplicate the URL after its quoted target.  The
+	// field instruction ends at that duplicate; remove the complete structural
+	// prefix before running the ordinary field expression cleanup.
+	s = wordHyperlinkDuplicatedURLRE.ReplaceAllString(s, "")
 	s = wordHyperlinkFieldRE.ReplaceAllString(s, "")
 	s = wordStyleRefFieldRE.ReplaceAllString(s, "")
 	s = wordNamedFieldRE.ReplaceAllString(s, "")
@@ -914,17 +978,63 @@ func stripWordFieldInstructions(s string) string {
 	s = wordPrivateAddinFieldRE.ReplaceAllString(s, "")
 	s = wordPicturePathFieldRE.ReplaceAllString(s, "")
 	s = wordSymbolFieldRE.ReplaceAllString(s, "")
-	s = wordFormattedSimpleFieldRE.ReplaceAllString(s, "")
-	s = wordSimpleFieldRE.ReplaceAllString(s, "")
+	// AUTOTEXTLIST is an instruction keyword even when a damaged legacy field
+	// omits its surrounding control characters. It has no ordinary visible-prose
+	// meaning, unlike ambiguous names such as DATE or PAGE.
+	s = wordAutoTextListFieldRE.ReplaceAllString(s, "")
+	if !keepBareFieldNames {
+		s = wordFormattedSimpleFieldRE.ReplaceAllString(s, "")
+		s = wordSimpleFieldRE.ReplaceAllString(s, "")
+	}
 	s = wordFormatSwitchRE.ReplaceAllString(s, "")
 	s = wordMergeFormatRE.ReplaceAllString(s, "")
-	s = orphanWordFieldTokenRE.ReplaceAllString(s, "")
+	if hasStructuredInstruction && !keepBareFieldNames {
+		s = orphanWordFieldTokenRE.ReplaceAllString(s, "")
+	}
 	s = spaceRE.ReplaceAllString(s, " ")
 	s = strings.ReplaceAll(s, " ,", ",")
 	s = strings.ReplaceAll(s, " .", ".")
 	s = strings.ReplaceAll(s, "( ", "(")
 	s = strings.ReplaceAll(s, " )", ")")
 	return strings.TrimSpace(s)
+}
+
+// wordVisibleHeadingWithBareFieldName recognizes the Word table-heading form
+// where a field-named word is immediately surrounded by ordinary heading
+// words. Regexes for damaged field instructions intentionally accept a bare
+// DATE/TIME/PAGE token, so without this guard they erase real content.
+func wordVisibleHeadingWithBareFieldName(s string) bool {
+	words := strings.Fields(s)
+	if len(words) < 3 {
+		return false
+	}
+	for i, word := range words {
+		name := strings.Trim(word, ".,;:()[]{}\"'")
+		// DATE is uniquely ambiguous in the audited legacy corpus: Word field
+		// cleanup accepts it as a bare field name, while table headings commonly
+		// use it literally. Other field names retain the established instruction
+		// behavior until a corresponding Office-visible counterexample exists.
+		if !strings.EqualFold(name, "DATE") {
+			continue
+		}
+		if i > 0 && i+1 < len(words) && wordHeadingNeighbor(words[i-1]) && wordHeadingNeighbor(words[i+1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func wordHeadingNeighbor(s string) bool {
+	s = strings.Trim(s, ".,;:()[]{}\"'")
+	if s == "" || len(s) > 40 || strings.ContainsAny(s, "\\{}") {
+		return false
+	}
+	for _, r := range s {
+		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func stripInlineHiddenOfficeReferences(s string) string {
@@ -1144,17 +1254,16 @@ func looksLikeLocalFileURIReference(lower string) bool {
 }
 
 func containsWordFieldInstructionMarker(s string) bool {
+	// A literal DATE/TIME/PAGE word is common in visible table headings.  These
+	// names alone are not evidence of a field instruction; the structured field
+	// expressions checked by stripWordFieldInstructions are sufficient.
 	for _, marker := range []string{
 		"HYPERLINK", "INCLUDEPICTURE", "PAGEREF", "REF", "NOTEREF",
 		"MERGEFIELD", "DOCPROPERTY", "DOCVARIABLE", "STYLEREF", "INCLUDETEXT",
-		"LINK", "EMBED", "MACROBUTTON", "TEMPLATE", "AUTHOR",
-		"CREATEDATE", "DATE", "TIME", "FILENAME", "FILESIZE",
-		"EDITTIME", "PAGE", "NUMPAGES", "SECTIONPAGES", "SUBJECT",
-		"KEYWORDS", "COMMENTS", "LASTSAVEDBY", "PRINTDATE", "SAVEDATE",
-		"USERNAME", "USERINITIALS", "SHAPE", "FORMTEXT", "FORMCHECKBOX",
-		"SYMBOL", "QUOTE", "AUTOTEXT", "AUTOTEXTLIST", "LISTNUM", "AUTONUM", "AUTONUMLGL", "AUTONUMOUT", "RD",
-		"TOC", "SEQ", "XE", "TC", "TA", "ASK", "FILLIN",
-		"SET", "IF", "CITATION", "BIBLIOGRAPHY", "DATABASE", "ADVANCE", "ADDIN", "PRIVATE", "MERGEFORMAT", "__RefHeading__", "_Toc",
+		"LINK", "EMBED", "MACROBUTTON", "TOC", "SEQ", "XE", "TC", "TA",
+		"ASK", "FILLIN", "SET", "IF", "CITATION", "BIBLIOGRAPHY", "DATABASE",
+		"ADVANCE", "ADDIN", "PRIVATE", "MERGEFORMAT", "__RefHeading__", "_Toc",
+		"\\*", "\\@",
 	} {
 		if strings.Contains(s, marker) {
 			return true
@@ -1269,15 +1378,75 @@ func repairUnbalancedASCIIQuoteLine(s string) string {
 }
 
 func repairMojibakeContractionLine(s string) string {
-	if !strings.Contains(s, "\u2019c") {
-		return s
+	if strings.Contains(s, "\u2019c") {
+		s = strings.NewReplacer(
+			"It\u2019c", "It\u2019s",
+			"it\u2019c", "it\u2019s",
+			"That\u2019c", "That\u2019s",
+			"that\u2019c", "that\u2019s",
+		).Replace(s)
 	}
-	return strings.NewReplacer(
-		"It\u2019c", "It\u2019s",
-		"it\u2019c", "it\u2019s",
-		"That\u2019c", "That\u2019s",
-		"that\u2019c", "that\u2019s",
+	// Keep ordinary typographic apostrophes intact: Word can expose them as
+	// U+2019, so changing them would diverge from Word.Content.Text. Only the
+	// known corrupt legacy encodings below are repaired to ASCII apostrophes.
+	// Some legacy Word single-byte text is decoded through a GBK locale before
+	// its apostrophe is recovered.  U+BB6A is then a deterministic stand-in for
+	// the ASCII apostrophe at the end of ordinary English contractions (aren뭪,
+	// didn뭪, haven뭪).  Repair only this letter-boundary form: it is not a
+	// general Chinese-text substitution and cannot alter a normal CJK word.
+	runes := []rune(s)
+	changed := false
+	for i := 1; i+1 < len(runes); i++ {
+		if runes[i] != '\uBB6A' || !isASCIILetter(runes[i-1]) || !isASCIILetter(runes[i+1]) {
+			continue
+		}
+		if runes[i+1] != 't' && runes[i+1] != 's' && runes[i+1] != 'r' && runes[i+1] != 'v' && runes[i+1] != 'm' && runes[i+1] != 'd' {
+			continue
+		}
+		runes[i] = '\''
+		changed = true
+	}
+	if changed {
+		s = string(runes)
+	}
+	// In another legacy Word code-page path the same U+BB6A consumes both the
+	// apostrophe and the trailing "t". These are complete English stems, so a
+	// narrow replacement is safer than treating the CJK rune generically.
+	s = strings.NewReplacer(
+		"Don\uBB6A", "Don't",
+		"Didn\uBB6A", "Didn't",
+		"Weren\uBB6A", "Weren't",
+		"Wouldn\uBB6A", "Wouldn't",
+		"aren\uBB6A", "aren't",
+		"didn\uBB6A", "didn't",
+		"doesn\uBB6A", "doesn't",
+		"don\uBB6A", "don't",
+		"haven\uBB6A", "haven't",
+		"isn\uBB6A", "isn't",
+		"wasn\uBB6A", "wasn't",
+		"weren\uBB6A", "weren't",
+		"wouldn\uBB6A", "wouldn't",
+		// A variant of the same legacy code-page corruption drops the final
+		// consonant together with the apostrophe/t pair ("were\uBB6A").
+		// Keep this explicit lexical repair rather than broad CJK substitution.
+		"were\uBB6A", "weren't",
 	).Replace(s)
+	return s
+}
+
+// repairLegacyWordContractions is intentionally narrower than generic text
+// cleanup. Binary .doc text can pass Word's legacy code-page path where the
+// COM-visible contractions are normalized to ASCII, while ordinary OOXML and
+// direct Unicode prose must retain their original U+2019 apostrophe.
+func repairLegacyWordContractions(s string) string {
+	s = strings.NewReplacer(
+		"aren\u2019t", "aren't", "didn\u2019t", "didn't",
+		"doesn\u2019t", "doesn't", "don\u2019t", "don't",
+		"haven\u2019t", "haven't", "isn\u2019t", "isn't",
+		"wasn\u2019t", "wasn't", "weren\u2019t", "weren't",
+		"wouldn\u2019t", "wouldn't",
+	).Replace(s)
+	return repairMojibakeContractionLine(s)
 }
 
 func repairGBKDecodedUTF8LatinAccentsLine(s string) string {
@@ -1324,8 +1493,27 @@ func isASCIILetter(r rune) bool {
 }
 
 func cleanTextNoMojibakeRepair(s string) string {
+	// This helper is used for structurally bounded Word CLX text as well as
+	// general cleanup. Do not take cleanText's fast path: it deliberately
+	// rejects a whole string if any line resembles an unscoped binary control
+	// fragment, which discards valid later paragraphs in long legacy documents.
+	return cleanTextNoMojibakeRepairSlow(s)
+}
+
+func cleanTextNoMojibakeRepairSlow(s string) string {
 	s = strings.ToValidUTF8(s, "")
-	s = strings.Map(cleanTextRune, s)
+	// Word.Content.Text uses C0 separators (notably 0x1f for w:softHyphen)
+	// to preserve a logical word boundary. Keep them until after rune cleanup:
+	// cleanTextRune intentionally removes invisible controls for general text,
+	// whereas strict Office comparison must retain this boundary as whitespace.
+	const wordBoundarySentinel = '\uE001'
+	s = strings.Map(func(r rune) rune {
+		if r == '\x1f' {
+			return wordBoundarySentinel
+		}
+		return cleanTextRune(r)
+	}, s)
+	s = strings.ReplaceAll(s, string(wordBoundarySentinel), " ")
 	s = spaceRE.ReplaceAllString(s, " ")
 	lines := strings.Split(s, "\n")
 	for i := range lines {
@@ -3850,7 +4038,10 @@ func wmfDeclaredSize(b []byte) (int, bool) {
 	if len(b) < 18 {
 		return 0, false
 	}
-	if len(b) >= 40 && binary.LittleEndian.Uint32(b) == 0x9ac6cdd7 {
+	// A placeable WMF is 22 bytes of placeable header plus an 18-byte standard
+	// header.  Small but valid Office-generated files can therefore be shorter
+	// than 40 bytes; checking the signature only needs the placeable header.
+	if len(b) >= 22 && binary.LittleEndian.Uint32(b) == 0x9ac6cdd7 {
 		if !validPlaceableWMFChecksum(b[:22]) {
 			return 0, false
 		}
@@ -3906,6 +4097,15 @@ func validStandardWMFRecords(b []byte, maxRecordWords uint32) bool {
 				return false
 			}
 			if end == len(b) {
+				return true
+			}
+			// Word may retain a bounded private/preview tail after META_EOF in a
+			// placeable WMF.  The standard header's declared record stream is
+			// already complete at EOF and Word still exposes these payloads as
+			// InlineShape pictures (for example the Open XML complex1 fixture).
+			// Accept only zero-prefixed trailing data so arbitrary appended bytes
+			// do not become valid image data.
+			if end < len(b) && b[end] == 0 {
 				return true
 			}
 			// Some Office-generated placeable WMFs include one terminating zero

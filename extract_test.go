@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -93,6 +94,82 @@ func TestVisiblePptxShapeTextKeepsBaselineOffsetMathRunsTogether(t *testing.T) {
 	}
 	if got != "A2x matrix" {
 		t.Fatalf("visible shape text = %q, want %q", got, "A2x matrix")
+	}
+}
+
+func TestVisiblePptxShapeTextKeepsAccentedCharacterRunWithWord(t *testing.T) {
+	b := []byte(`<p:spTree xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:sp><p:txBody><a:p><a:r><a:t>Jos</a:t></a:r><a:r><a:t>é</a:t></a:r></a:p></p:txBody></p:sp></p:spTree>`)
+	got, err := visiblePptxShapeText(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "José" {
+		t.Fatalf("visible shape text = %q, want José", got)
+	}
+}
+
+func TestPPTX22652StrictUsesOnlyPresentationReferencedSlides(t *testing.T) {
+	zr, err := zip.OpenReader("testdata/web-samples/samples/pptx/00022652.pptx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	files := make(map[string]*zip.File, len(zr.File))
+	for _, f := range zr.File {
+		files[f.Name] = f
+	}
+	names, err := pptxVisibleSlideNames(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The checked-in corpus sample now includes slide111 in presentation.xml's
+	// authoritative sldIdLst. Keep this assertion tied to the package's actual
+	// relationship list rather than a stale fixed count.
+	if len(names) != 111 || names[len(names)-1] != "ppt/slides/slide111.xml" {
+		t.Fatalf("visible slide list = %d entries ending %q, want 111 entries ending slide111.xml", len(names), names[len(names)-1])
+	}
+	result, err := Extract("testdata/web-samples/samples/pptx/00022652.pptx", Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Text, "Amdahl") {
+		t.Fatalf("strict PPTX result missing known referenced-slide text")
+	}
+	if !strings.Contains(result.Text, "AFIPS Conference Proceedings") {
+		t.Fatal("strict PPTX omitted slide111 content referenced by p:sldIdLst")
+	}
+}
+
+func TestPPTXPresentationSlideNamesDoNotRecoverNoncontiguousOrphanSlide(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	addZip(t, zw, "[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`)
+	addZip(t, zw, "ppt/presentation.xml", `<p:presentation xmlns:p="urn:p" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId r:id="rId1"/></p:sldIdLst></p:presentation>`)
+	addZip(t, zw, "ppt/_rels/presentation.xml.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="x" Target="slides/slide1.xml"/></Relationships>`)
+	addZip(t, zw, "ppt/slides/slide1.xml", `<p:sld xmlns:p="urn:p"/>`)
+	// A damaged package may also contain an unrelated slide part. A valid
+	// presentation slide-id list remains authoritative over that orphan.
+	addZip(t, zw, "ppt/slides/slide3.xml", `<p:sld xmlns:p="urn:p"/>`)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[string]*zip.File, len(zr.File))
+	for _, f := range zr.File {
+		files[f.Name] = f
+	}
+	names, constrained, err := pptxPresentationSlideNames(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !constrained {
+		t.Fatalf("presentation slide names should remain authoritative")
+	}
+	if want := []string{"ppt/slides/slide1.xml"}; !reflect.DeepEqual(names, want) {
+		t.Fatalf("presentation slide names = %#v, want %#v", names, want)
 	}
 }
 
@@ -1345,6 +1422,48 @@ func TestStrictDOCXSuppressesTextRenderedBySymbolFont(t *testing.T) {
 	}
 }
 
+func TestStrictDOCXSymbolFontUsesWordContentFallback(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	addZip(t, zw, "[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`)
+	addZip(t, zw, "word/document.xml", `<w:document xmlns:w="urn:w"><w:body><w:p><w:r><w:t>Greek delta </w:t><w:sym w:font="Symbol" w:char="F062"/></w:r></w:p></w:body></w:document>`)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "strict-symbol.docx")
+	if err := os.WriteFile(file, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Extract(file, Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Text, "Greek delta (") || strings.Contains(res.Text, "β") {
+		t.Fatalf("strict Symbol text = %q", res.Text)
+	}
+}
+
+func TestStrictDOCXDoesNotDecodeProseTaggedAsSymbolFont(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	addZip(t, zw, "[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`)
+	addZip(t, zw, "word/document.xml", `<w:document xmlns:w="urn:w"><w:body><w:p><w:r><w:rPr><w:rFonts w:hAnsi="Symbol"/></w:rPr><w:t>joint reviews of shared facilities</w:t></w:r></w:p></w:body></w:document>`)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "symbol-prose.docx")
+	if err := os.WriteFile(file, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Extract(file, Options{StrictOfficeContent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Text, "joint reviews of shared facilities") {
+		t.Fatalf("strict Symbol-font prose = %q", res.Text)
+	}
+}
+
 func TestLegacyWordFieldInstructionsAreStrippedFromText(t *testing.T) {
 	text := cleanText(`AUTHOR \* Upper \* MERGEFORMAT ANTONI
 CREATEDATE \@ "d MMMM yyyy" \* MERGEFORMAT 16 June 2010
@@ -1826,13 +1945,13 @@ func TestMojibakePunctuationIsRepairedAndBinaryNoiseDropped(t *testing.T) {
 }
 
 func TestMojibakeContractionsAreRepaired(t *testing.T) {
-	text := cleanText("It\u2019c consistent with our values.\nThat\u2019c a visible sentence.\nI don\u2019t plan to change this.")
-	for _, want := range []string{"It\u2019s consistent", "That\u2019s a visible sentence", "I don\u2019t plan"} {
+	text := cleanText("It\u2019c consistent with our values.\nThat\u2019c a visible sentence.\nI don\u2019t plan to change this.\nThey aren\uBB6At ready, and we didn\uBB6At leave.\nWe aren\uBB6A ready; it doesn\uBB6A matter and they wouldn\uBB6A agree.")
+	for _, want := range []string{"It\u2019s consistent", "That\u2019s a visible sentence", "I don\u2019t plan", "aren't ready", "didn't leave", "doesn't matter", "wouldn't agree"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing repaired contraction %q in %q", want, text)
 		}
 	}
-	for _, bad := range []string{"It\u2019c", "That\u2019c"} {
+	for _, bad := range []string{"It\u2019c", "That\u2019c", "aren\uBB6At", "didn\uBB6At"} {
 		if strings.Contains(text, bad) {
 			t.Fatalf("kept mojibake contraction %q in %q", bad, text)
 		}
@@ -15998,7 +16117,7 @@ func TestStrictPPTXWebSampleMatchesPowerPointPictureCount(t *testing.T) {
 	}
 }
 
-func TestStrictPPTXExcludesGroupedAndMediaPlayerPictureCaches(t *testing.T) {
+func TestStrictPPTXIncludesGroupedPicturesAndExcludesMediaPlayerCaches(t *testing.T) {
 	file := filepath.Join("testdata", "web-samples", "samples", "pptx", "00022654.pptx")
 	zr, err := zip.OpenReader(file)
 	if err != nil {
@@ -16009,18 +16128,60 @@ func TestStrictPPTXExcludesGroupedAndMediaPlayerPictureCaches(t *testing.T) {
 	for _, f := range zr.File {
 		files[f.Name] = f
 	}
-	if media, ok := strictPptxVisibleMediaParts(files); !ok || len(media) != 23 {
-		t.Fatalf("strict PPTX media count = %d, ok=%v; want 23", len(media), ok)
+	if media, ok := strictPptxVisibleMediaParts(files); !ok || len(media) != 33 {
+		t.Fatalf("strict PPTX media count = %d, ok=%v; want 33", len(media), ok)
 	}
 	result, err := Extract(file, Options{StrictOfficeImages: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// PowerPoint COM exposes 23 top-level msoPicture shapes. This deck also
-	// contains ten grouped Picture Shapes and nine Windows Media Player poster
-	// caches; neither belongs to Slide.Shapes as a Picture.
-	if len(result.Images) != 23 {
-		t.Fatalf("strict PPTX image count = %d, want 23 PowerPoint Picture Shapes", len(result.Images))
+	// PowerPoint COM exposes 33 Picture Shapes, including ten GroupItems.
+	// The deck also contains nine Windows Media Player poster caches, which do
+	// not belong to PowerPoint's visible Picture Shape collection.
+	if len(result.Images) != 33 {
+		t.Fatalf("strict PPTX image count = %d, want 33 PowerPoint Picture Shapes", len(result.Images))
+	}
+}
+
+func TestStrictPPTXKeepsAdjacentHyperlinkRunsTogether(t *testing.T) {
+	text, err := visiblePptxShapeText([]byte(`<p:sld xmlns:p="urn:p" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="urn:r"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:rPr><a:hlinkClick r:id="rId1"/></a:rPr><a:t>www.example.com/path</a:t></a:r><a:r><a:rPr><a:hlinkClick r:id="rId1"/></a:rPr><a:t>11</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "www.example.com/path11") {
+		t.Fatalf("strict PPTX text = %q, want adjacent hyperlink runs joined", text)
+	}
+}
+
+func TestStrictPPTXRecalculatesDynamicDateAndSlideNumberFields(t *testing.T) {
+	b := []byte(`<p:sld xmlns:p="urn:p" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:fld type="datetime4"><a:t>November 8, 2010</a:t></a:fld></a:p></p:txBody></p:sp><p:sp><p:txBody><a:p><a:fld type="slidenum"><a:t>7</a:t></a:fld></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>`)
+	got, err := visiblePptxShapeTextWithDynamicFields(b, 12, time.Date(2026, time.August, 1, 9, 5, 0, 0, time.Local))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "August 1, 2026\n12" {
+		t.Fatalf("dynamic field text = %q, want current date and slide number", got)
+	}
+}
+
+func TestStrictPPTXDynamicDatetime8UsesPowerPointShortDate(t *testing.T) {
+	got, ok := pptxDynamicFieldValue("datetime8", 0, time.Date(2026, time.August, 1, 13, 1, 0, 0, time.Local))
+	if !ok || got != "8/1/2026 1:01 PM" {
+		t.Fatalf("datetime8 = %q, ok=%v; want PowerPoint short date", got, ok)
+	}
+}
+
+func TestStrictPPTXDynamicDatetime1UsesPowerPointShortDate(t *testing.T) {
+	got, ok := pptxDynamicFieldValue("datetime1", 0, time.Date(2026, time.August, 1, 9, 5, 0, 0, time.Local))
+	if !ok || got != "8/1/2026" {
+		t.Fatalf("datetime1 = %q, ok=%v; want PowerPoint short date", got, ok)
+	}
+}
+
+func TestStrictPPTXDynamicDatetime5UsesPowerPointDayMonthYear(t *testing.T) {
+	got, ok := pptxDynamicFieldValue("datetime5", 0, time.Date(2026, time.August, 1, 9, 5, 0, 0, time.Local))
+	if !ok || got != "1-Aug-26" {
+		t.Fatalf("datetime5 = %q, ok=%v; want PowerPoint day-month-year", got, ok)
 	}
 }
 
@@ -16030,10 +16191,10 @@ func TestStrictPPTXExcludesVideoPosterFrameCaches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// PowerPoint COM exposes 88 msoPicture shapes. The remaining top-level
-	// p:pic in this package is the poster frame for an embedded AVI control.
-	if len(result.Images) != 88 {
-		t.Fatalf("strict PPTX image count = %d, want 88 PowerPoint Picture Shapes", len(result.Images))
+	// PowerPoint COM exposes 155 visible Picture Shapes when recursively
+	// walking GroupItems. The embedded AVI poster cache remains excluded.
+	if len(result.Images) != 155 {
+		t.Fatalf("strict PPTX image count = %d, want 155 PowerPoint Picture Shapes", len(result.Images))
 	}
 }
 
@@ -16048,7 +16209,7 @@ func TestStrictPPTXPreservesRepeatedVisiblePictureOccurrences(t *testing.T) {
 	}
 }
 
-func TestStrictPPTXTextExcludesGroupedShapesAndPictureAltText(t *testing.T) {
+func TestStrictPPTXTextKeepsGroupedShapesAndExcludesPictureAltText(t *testing.T) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	addZip(t, zw, "[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`)
@@ -16071,8 +16232,8 @@ func TestStrictPPTXTextExcludesGroupedShapesAndPictureAltText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Text != "Top Level Text" {
-		t.Fatalf("strict PowerPoint text = %q, want top-level shape text only", res.Text)
+	if res.Text != "Top Level Text\nGrouped Text" {
+		t.Fatalf("strict PowerPoint text = %q, want top-level and grouped shape text", res.Text)
 	}
 }
 
@@ -19048,5 +19209,48 @@ func addZipBytes(t *testing.T, zw *zip.Writer, name string, data []byte) {
 	}
 	if _, err := w.Write(data); err != nil {
 		t.Fatal(err)
+	}
+}
+func TestXlsxStrictOfficeImagesIncludeVMLPictureFrameOnly(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	addZip(t, zw, "[Content_Types].xml", `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`)
+	addZip(t, zw, "xl/workbook.xml", `<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Visible" sheetId="1" r:id="rId1"/></sheets></workbook>`)
+	addZip(t, zw, "xl/_rels/workbook.xml.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="worksheet" Target="worksheets/sheet1.xml"/></Relationships>`)
+	addZip(t, zw, "xl/worksheets/sheet1.xml", `<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><legacyDrawing r:id="rId1"/></worksheet>`)
+	addZip(t, zw, "xl/worksheets/_rels/sheet1.xml.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="vmlDrawing" Target="../drawings/vmlDrawing1.vml"/></Relationships>`)
+	addZip(t, zw, "xl/drawings/vmlDrawing1.vml", `<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><v:shape id="picture"><v:imagedata o:relid="rIdPicture"/><x:ClientData ObjectType="Pict"/></v:shape><v:shape id="comment"><v:imagedata o:relid="rIdComment"/><x:ClientData ObjectType="Note"/></v:shape></xml>`)
+	addZip(t, zw, "xl/drawings/_rels/vmlDrawing1.vml.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdPicture" Type="image" Target="../media/picture.png"/><Relationship Id="rIdComment" Type="image" Target="../media/comment.jpg"/></Relationships>`)
+	addZipBytes(t, zw, "xl/media/picture.png", testPNG())
+	addZipBytes(t, zw, "xl/media/comment.jpg", testJPEG())
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "vml-picture.xlsx")
+	if err := os.WriteFile(file, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	zr, err := zip.OpenReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	files := map[string]*zip.File{}
+	for _, entry := range zr.File {
+		files[entry.Name] = entry
+	}
+	if ids, err := xlsxVMLPictureRelationshipIDOccurrences(files, "xl/drawings/vmlDrawing1.vml", nil); err != nil || !reflect.DeepEqual(ids, []string{"rIdPicture"}) {
+		t.Fatalf("unexpected VML picture refs: %v, %v", ids, err)
+	}
+	if visible := xlsxVisibleVMLPictureMediaParts(files, []workbookSheet{{Path: "xl/worksheets/sheet1.xml"}}); !visible["xl/media/picture.png"] {
+		t.Fatalf("VML PictureFrame media was not admitted: %#v", visible)
+	}
+	res, err := Extract(file, Options{StrictOfficeImages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Images) != 1 || res.Images[0].Name != "picture.png" {
+		t.Fatalf("expected only VML PictureFrame image, got %#v", res.Images)
 	}
 }
