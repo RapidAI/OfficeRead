@@ -7,7 +7,7 @@ import (
 	"runtime/pprof"
 	"time"
 
-	"officeread"
+	"github.com/RapidAI/OfficeRead"
 )
 
 func main() {

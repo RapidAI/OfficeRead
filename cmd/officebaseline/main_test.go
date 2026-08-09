@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"officeread"
+	"github.com/RapidAI/OfficeRead"
 )
 
 func TestAddFileSkipsOfficeOwnerLockFile(t *testing.T) {

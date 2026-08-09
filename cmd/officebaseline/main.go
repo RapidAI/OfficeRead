@@ -28,7 +28,7 @@ import (
 
 	"golang.org/x/text/unicode/norm"
 
-	"officeread"
+	"github.com/RapidAI/OfficeRead"
 )
 
 var supportedExts = map[string]bool{

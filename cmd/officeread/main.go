@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"officeread"
+	"github.com/RapidAI/OfficeRead"
 )
 
 func main() {

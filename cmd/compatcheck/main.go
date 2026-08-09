@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"officeread"
+	"github.com/RapidAI/OfficeRead"
 )
 
 var supportedExts = map[string]bool{

@@ -1,4 +1,4 @@
-module officeread
+module github.com/RapidAI/OfficeRead
 
 go 1.25.0
 

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"unicode"
 
-	"officeread"
+	"github.com/RapidAI/OfficeRead"
 )
 
 var officeExts = map[string]bool{
