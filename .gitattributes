@@ -1,0 +1,8 @@
+# The full Office corpus is retained in Git for OfficeRead's own regression
+# suite, but it is not required to compile or run the library. Excluding it
+# from source archives keeps downstream `go mod download` practical.
+testdata/ export-ignore
+
+# Generated extraction outputs are developer artifacts, not library sources.
+extract-output/ export-ignore
+reports/ export-ignore
