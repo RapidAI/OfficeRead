@@ -1,0 +1,12 @@
+# Keep development-only corpus, generated outputs, and local caches out of the
+# distributable Go module branch. The full corpus remains on `main`.
+testdata/
+images/
+extract-output/
+reports/
+.gocache/
+.gocache-local/
+compat-report.csv
+compat-report.json
+office-baseline-expanded-10.json
+office-baseline-report.json
